@@ -33,7 +33,7 @@ import http from 'http';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type { ChannelAdapter, ChannelSetup, ConversationConfig, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 
 const CHANNEL_TYPE = 'webapp';
 const DEFAULT_PORT = 3099;
@@ -51,15 +51,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
     const bindHost = env.WEBAPP_BIND_HOST ?? DEFAULT_BIND_HOST;
 
     let setupConfig: ChannelSetup | null = null;
-    // Keyed by bare community_id (without 'webapp:' prefix) for easy inbound lookup.
-    // ConversationConfig.platformId retains the full 'webapp:<id>' for onInbound calls.
-    let conversations = new Map<string, ConversationConfig>();
     let server: http.Server | null = null;
     let connected = false;
-
-    function bareId(platformId: string): string {
-      return platformId.startsWith(`${CHANNEL_TYPE}:`) ? platformId.slice(CHANNEL_TYPE.length + 1) : platformId;
-    }
 
     function parseBody(req: http.IncomingMessage): Promise<Record<string, string>> {
       return new Promise((resolve, reject) => {
@@ -117,17 +110,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
-      if (!conversations.has(community_id)) {
-        log.warn('Webapp: message for unregistered community', { community_id });
-        res.writeHead(404).end(JSON.stringify({ error: 'Community not registered' }));
-        return;
-      }
-
       // Respond immediately — agent reply arrives asynchronously via callback
       res.writeHead(202).end(JSON.stringify({ status: 'accepted' }));
 
-      const conv = conversations.get(community_id)!;
-      await setupConfig!.onInbound(conv.platformId, thread_id, {
+      // Construct the full platform_id — must match what was registered in the DB
+      const platformId = `${CHANNEL_TYPE}:${community_id}`;
+      await setupConfig!.onInbound(platformId, thread_id, {
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         kind: 'chat',
         content: {
@@ -147,7 +135,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
       async setup(config: ChannelSetup): Promise<void> {
         setupConfig = config;
-        conversations = new Map(config.conversations.map((c) => [bareId(c.platformId), c]));
 
         server = http.createServer(async (req, res) => {
           res.setHeader('Content-Type', 'application/json');
@@ -185,10 +172,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
       isConnected(): boolean {
         return connected;
-      },
-
-      updateConversations(updated: ConversationConfig[]): void {
-        conversations = new Map(updated.map((c) => [bareId(c.platformId), c]));
       },
 
       async deliver(
