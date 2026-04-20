@@ -41,3 +41,6 @@ import './imessage.js';
 
 // whatsapp (native, no Chat SDK)
 import './whatsapp.js';
+
+// webapp (native HTTP bridge for custom web frontends)
+import './webapp.js';
