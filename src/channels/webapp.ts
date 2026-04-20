@@ -33,12 +33,7 @@ import http from 'http';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type {
-  ChannelAdapter,
-  ChannelSetup,
-  ConversationConfig,
-  OutboundMessage,
-} from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, ConversationConfig, OutboundMessage } from './adapter.js';
 
 const CHANNEL_TYPE = 'webapp';
 const DEFAULT_PORT = 3099;
@@ -137,9 +132,9 @@ registerChannelAdapter(CHANNEL_TYPE, {
         kind: 'chat',
         content: {
           text: message,
-          senderId: user_id,              // router prepends 'webapp:' → 'webapp:<user_id>'
+          senderId: user_id, // router prepends 'webapp:' → 'webapp:<user_id>'
           senderName: display_name ?? user_id,
-          role: role ?? 'user',           // informational — NanoClaw roles set via user_roles table
+          role: role ?? 'user', // informational — NanoClaw roles set via user_roles table
         },
         timestamp: new Date().toISOString(),
       });
@@ -196,7 +191,11 @@ registerChannelAdapter(CHANNEL_TYPE, {
         conversations = new Map(updated.map((c) => [bareId(c.platformId), c]));
       },
 
-      async deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
+      async deliver(
+        platformId: string,
+        threadId: string | null,
+        message: OutboundMessage,
+      ): Promise<string | undefined> {
         try {
           return await postCallback({
             community_id: platformId,
