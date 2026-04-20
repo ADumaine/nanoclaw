@@ -1,7 +1,7 @@
 /**
  * Seed the v2 central DB with a Discord agent group + messaging group.
  *
- * Usage: npx tsx scripts/seed-discord.ts
+ * Usage: pnpm exec tsx scripts/seed-discord.ts
  */
 import path from 'path';
 
@@ -58,8 +58,12 @@ try {
     id: 'mga-discord',
     messaging_group_id: MESSAGING_GROUP_ID,
     agent_group_id: AGENT_GROUP_ID,
-    trigger_rules: null,
-    response_scope: 'all',
+    // Discord group channel → mention-sticky default. Mention once, stay
+    // subscribed to the thread. Admins can tune via /manage-channels.
+    engage_mode: 'mention-sticky',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
     session_mode: 'shared',
     priority: 0,
     created_at: new Date().toISOString(),
@@ -73,4 +77,4 @@ try {
   }
 }
 
-console.log('Done! Run: npm run build && node dist/index.js');
+console.log('Done! Run: pnpm run build && node dist/index.js');

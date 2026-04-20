@@ -17,35 +17,35 @@
  * src/session-manager.ts for the full set of cross-mount invariants and
  * scripts/sanity-live-poll.ts for the empirical validation.
  */
-import Database from 'better-sqlite3';
+import { Database } from 'bun:sqlite';
 import fs from 'fs';
 
 const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
 const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
 const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
 
-let _inbound: Database.Database | null = null;
-let _outbound: Database.Database | null = null;
+let _inbound: Database | null = null;
+let _outbound: Database | null = null;
 let _heartbeatPath: string = DEFAULT_HEARTBEAT_PATH;
 
 /** Inbound DB — container opens read-only (host is the sole writer). */
-export function getInboundDb(): Database.Database {
+export function getInboundDb(): Database {
   if (!_inbound) {
     const dbPath = process.env.SESSION_INBOUND_DB_PATH || DEFAULT_INBOUND_PATH;
     _inbound = new Database(dbPath, { readonly: true });
-    _inbound.pragma('busy_timeout = 5000');
+    _inbound.exec('PRAGMA busy_timeout = 5000');
   }
   return _inbound;
 }
 
 /** Outbound DB — container owns this file (sole writer). */
-export function getOutboundDb(): Database.Database {
+export function getOutboundDb(): Database {
   if (!_outbound) {
     const dbPath = process.env.SESSION_OUTBOUND_DB_PATH || DEFAULT_OUTBOUND_PATH;
     _outbound = new Database(dbPath);
-    _outbound.pragma('journal_mode = DELETE');
-    _outbound.pragma('busy_timeout = 5000');
-    _outbound.pragma('foreign_keys = ON');
+    _outbound.exec('PRAGMA journal_mode = DELETE');
+    _outbound.exec('PRAGMA busy_timeout = 5000');
+    _outbound.exec('PRAGMA foreign_keys = ON');
     // Lightweight forward-compat: session_state was added after the initial
     // v2 schema, so older session DBs don't have it. Create it on demand
     // instead of requiring a formal migration pass. Also handle the case
@@ -64,8 +64,56 @@ export function getOutboundDb(): Database.Database {
     if (!cols.has('updated_at')) {
       _outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
     }
+    // container_state: tracks the current tool in flight (if any) so the host
+    // sweep can widen its stuck tolerance when Bash is running with a user-
+    // declared long timeout. Forward-compat for older outbound.db files.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS container_state (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        current_tool             TEXT,
+        tool_declared_timeout_ms INTEGER,
+        tool_started_at          TEXT,
+        updated_at               TEXT NOT NULL
+      );
+    `);
   }
   return _outbound;
+}
+
+/**
+ * Record that a tool is starting. `declaredTimeoutMs` is the tool's own
+ * timeout hint when one is available (Bash exposes it in the tool_use input);
+ * omit for tools with no declared timeout.
+ */
+export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number | null): void {
+  const now = new Date().toISOString();
+  getOutboundDb()
+    .prepare(
+      `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+       VALUES (1, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         current_tool = excluded.current_tool,
+         tool_declared_timeout_ms = excluded.tool_declared_timeout_ms,
+         tool_started_at = excluded.tool_started_at,
+         updated_at = excluded.updated_at`,
+    )
+    .run(tool, declaredTimeoutMs, now, now);
+}
+
+/** Clear the in-flight tool — called on PostToolUse / PostToolUseFailure. */
+export function clearContainerToolInFlight(): void {
+  const now = new Date().toISOString();
+  getOutboundDb()
+    .prepare(
+      `INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+       VALUES (1, NULL, NULL, NULL, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         current_tool = NULL,
+         tool_declared_timeout_ms = NULL,
+         tool_started_at = NULL,
+         updated_at = excluded.updated_at`,
+    )
+    .run(now);
 }
 
 /**
@@ -97,9 +145,9 @@ export function clearStaleProcessingAcks(): void {
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */
-export function initTestSessionDb(): { inbound: Database.Database; outbound: Database.Database } {
+export function initTestSessionDb(): { inbound: Database; outbound: Database } {
   _inbound = new Database(':memory:');
-  _inbound.pragma('foreign_keys = ON');
+  _inbound.exec('PRAGMA foreign_keys = ON');
   _inbound.exec(`
     CREATE TABLE messages_in (
       id             TEXT PRIMARY KEY,
@@ -109,7 +157,9 @@ export function initTestSessionDb(): { inbound: Database.Database; outbound: Dat
       status         TEXT DEFAULT 'pending',
       process_after  TEXT,
       recurrence     TEXT,
+      series_id      TEXT,
       tries          INTEGER DEFAULT 0,
+      trigger        INTEGER NOT NULL DEFAULT 1,
       platform_id    TEXT,
       channel_type   TEXT,
       thread_id      TEXT,
@@ -132,7 +182,7 @@ export function initTestSessionDb(): { inbound: Database.Database; outbound: Dat
   `);
 
   _outbound = new Database(':memory:');
-  _outbound.pragma('foreign_keys = ON');
+  _outbound.exec('PRAGMA foreign_keys = ON');
   _outbound.exec(`
     CREATE TABLE messages_out (
       id             TEXT PRIMARY KEY,
@@ -157,6 +207,13 @@ export function initTestSessionDb(): { inbound: Database.Database; outbound: Dat
       value      TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE container_state (
+      id                       INTEGER PRIMARY KEY CHECK (id = 1),
+      current_tool             TEXT,
+      tool_declared_timeout_ms INTEGER,
+      tool_started_at          TEXT,
+      updated_at               TEXT NOT NULL
+    );
   `);
 
   return { inbound: _inbound, outbound: _outbound };
@@ -173,6 +230,6 @@ export function closeSessionDb(): void {
  * @deprecated Use getInboundDb() / getOutboundDb() instead.
  * Kept for backward compatibility during migration.
  */
-export function getSessionDb(): Database.Database {
+export function getSessionDb(): Database {
   return getInboundDb();
 }

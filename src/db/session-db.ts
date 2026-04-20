@@ -71,8 +71,14 @@ export function replaceDestinations(db: Database.Database, entries: DestinationR
 // messages_in
 // ---------------------------------------------------------------------------
 
-/** Next even seq number for host-owned inbound.db. */
-function nextEvenSeq(db: Database.Database): number {
+/**
+ * Next even seq number for host-owned inbound.db.
+ *
+ * Exported so the scheduling module's task helpers can maintain the
+ * host-writes-even-seq invariant without duplicating the logic. Not part of
+ * the general public API — imported by `src/modules/scheduling/db.ts` only.
+ */
+export function nextEvenSeq(db: Database.Database): number {
   const maxSeq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
   return maxSeq < 2 ? 2 : maxSeq + 2 - (maxSeq % 2);
 }
@@ -89,112 +95,21 @@ export function insertMessage(
     content: string;
     processAfter: string | null;
     recurrence: string | null;
+    /**
+     * 1 = wake the agent (default); 0 = accumulate as context only.
+     * Host countDueMessages gates on this; container reads everything.
+     */
+    trigger?: 0 | 1;
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger)`,
   ).run({
     ...message,
+    trigger: message.trigger ?? 1,
     seq: nextEvenSeq(db),
   });
-}
-
-export function insertTask(
-  db: Database.Database,
-  task: {
-    id: string;
-    processAfter: string;
-    recurrence: string | null;
-    platformId: string | null;
-    channelType: string | null;
-    threadId: string | null;
-    content: string;
-  },
-): void {
-  db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @id)`,
-  ).run({
-    ...task,
-    seq: nextEvenSeq(db),
-  });
-}
-
-// cancel/pause/resume match any live row in the series, not just the exact id.
-// Recurring tasks get a new row per occurrence (see handleRecurrence), all
-// sharing series_id. Matching by id alone would only hit the completed row
-// the agent remembers, missing the live next occurrence.
-export function cancelTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'completed', recurrence = NULL WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
-  ).run(taskId, taskId);
-}
-
-export function pauseTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'paused' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'pending'",
-  ).run(taskId, taskId);
-}
-
-export function resumeTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'pending' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'paused'",
-  ).run(taskId, taskId);
-}
-
-export interface TaskUpdate {
-  prompt?: string;
-  script?: string | null;
-  recurrence?: string | null;
-  processAfter?: string;
-}
-
-// Merges content JSON in-place so callers can update prompt/script without
-// clobbering other fields. Matches by id OR series_id so the live next
-// occurrence of a recurring task is updated, not just the completed row the
-// agent last saw. Returns the number of rows touched.
-export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
-  const rows = db
-    .prepare(
-      "SELECT id, content FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
-    )
-    .all(taskId, taskId) as Array<{ id: string; content: string }>;
-
-  if (rows.length === 0) return 0;
-
-  const setProcessAfter = update.processAfter !== undefined;
-  const setRecurrence = update.recurrence !== undefined;
-  const mergeContent = update.prompt !== undefined || update.script !== undefined;
-
-  const tx = db.transaction(() => {
-    for (const row of rows) {
-      let content = row.content;
-      if (mergeContent) {
-        const parsed = JSON.parse(row.content) as Record<string, unknown>;
-        if (update.prompt !== undefined) parsed.prompt = update.prompt;
-        if (update.script !== undefined) parsed.script = update.script;
-        content = JSON.stringify(parsed);
-      }
-
-      // Build SET clause dynamically so callers can update fields independently.
-      const sets: string[] = ['content = ?'];
-      const params: unknown[] = [content];
-      if (setProcessAfter) {
-        sets.push('process_after = ?');
-        params.push(update.processAfter);
-      }
-      if (setRecurrence) {
-        sets.push('recurrence = ?');
-        params.push(update.recurrence);
-      }
-      params.push(row.id);
-
-      db.prepare(`UPDATE messages_in SET ${sets.join(', ')} WHERE id = ?`).run(...params);
-    }
-  });
-  tx();
-  return rows.length;
 }
 
 export function countDueMessages(db: Database.Database): number {
@@ -203,6 +118,7 @@ export function countDueMessages(db: Database.Database): number {
       .prepare(
         `SELECT COUNT(*) as count FROM messages_in
        WHERE status = 'pending'
+         AND trigger = 1
          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
       )
       .get() as { count: number }
@@ -229,51 +145,6 @@ export function getMessageForRetry(
     | undefined;
 }
 
-export interface RecurringMessage {
-  id: string;
-  kind: string;
-  content: string;
-  recurrence: string;
-  process_after: string | null;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  series_id: string;
-}
-
-export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
-  return db
-    .prepare("SELECT * FROM messages_in WHERE status = 'completed' AND recurrence IS NOT NULL")
-    .all() as RecurringMessage[];
-}
-
-export function insertRecurrence(
-  db: Database.Database,
-  msg: RecurringMessage,
-  newId: string,
-  nextRun: string | null,
-): void {
-  db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    newId,
-    nextEvenSeq(db),
-    msg.kind,
-    nextRun,
-    msg.recurrence,
-    msg.platform_id,
-    msg.channel_type,
-    msg.thread_id,
-    msg.content,
-    msg.series_id,
-  );
-}
-
-export function clearRecurrence(db: Database.Database, messageId: string): void {
-  db.prepare('UPDATE messages_in SET recurrence = NULL WHERE id = ?').run(messageId);
-}
-
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): void {
   const completed = outDb
     .prepare("SELECT message_id FROM processing_ack WHERE status IN ('completed', 'failed')")
@@ -295,6 +166,45 @@ export function getStuckProcessingIds(outDb: Database.Database): string[] {
       message_id: string;
     }>
   ).map((r) => r.message_id);
+}
+
+export interface ProcessingClaim {
+  message_id: string;
+  status_changed: string;
+}
+
+/** Return processing_ack rows still in 'processing' with their claim timestamps. */
+export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[] {
+  return outDb
+    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'processing'")
+    .all() as ProcessingClaim[];
+}
+
+export interface ContainerState {
+  current_tool: string | null;
+  tool_declared_timeout_ms: number | null;
+  tool_started_at: string | null;
+}
+
+/**
+ * Read the container's current tool-in-flight state, if any. Returns null
+ * when either the table doesn't exist yet (older session DB) or no tool is
+ * active. Host sweep reads this to widen stuck-detection tolerance while
+ * Bash is running with a long declared timeout.
+ */
+export function getContainerState(outDb: Database.Database): ContainerState | null {
+  try {
+    const row = outDb
+      .prepare(
+        `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+           FROM container_state WHERE id = 1`,
+      )
+      .get() as ContainerState | undefined;
+    return row ?? null;
+  } catch {
+    // Table not present on older session DBs — treat as "no tool in flight".
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +267,9 @@ export function migrateDeliveredTable(db: Database.Database): void {
   }
 }
 
-// Adds series_id (groups all occurrences of a recurring task) to pre-existing
-// messages_in tables. No-op on fresh installs where the column is in the schema.
-// Backfills existing rows so cancel/pause/resume queries can rely on
-// series_id IS NOT NULL.
+// Adds columns added to messages_in after the initial v2 schema to
+// pre-existing session DBs. No-op on fresh installs where the columns are
+// in the baseline schema. Backfills existing rows so invariants hold.
 export function migrateMessagesInTable(db: Database.Database): void {
   const cols = new Set(
     (db.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
@@ -369,5 +278,10 @@ export function migrateMessagesInTable(db: Database.Database): void {
     db.prepare('ALTER TABLE messages_in ADD COLUMN series_id TEXT').run();
     db.prepare('UPDATE messages_in SET series_id = id WHERE series_id IS NULL').run();
     db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id)').run();
+  }
+  if (!cols.has('trigger')) {
+    // All pre-existing rows got written with the old "every inbound wakes
+    // the agent" semantics, so backfill 1 and default 1 for new inserts.
+    db.prepare('ALTER TABLE messages_in ADD COLUMN trigger INTEGER NOT NULL DEFAULT 1').run();
   }
 }

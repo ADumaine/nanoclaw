@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # setup.sh — Bootstrap script for NanoClaw
-# Handles Node.js/npm setup, then hands off to the Node.js setup modules.
+# Handles Node.js/pnpm setup, then hands off to the Node.js setup modules.
 # This is the only bash script in the setup flow.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,32 +59,40 @@ check_node() {
   fi
 }
 
-# --- npm install ---
+# --- pnpm install ---
 
 install_deps() {
   DEPS_OK="false"
   NATIVE_OK="false"
 
   if [ "$NODE_OK" = "false" ]; then
-    log "Skipping npm install — Node not available"
+    log "Skipping pnpm install — Node not available"
     return
   fi
 
   cd "$PROJECT_ROOT"
 
-  # npm install with --unsafe-perm if root (needed for native modules)
-  local npm_flags=""
-  if [ "$IS_ROOT" = "true" ]; then
-    npm_flags="--unsafe-perm"
-    log "Running as root, using --unsafe-perm"
+  # Enable corepack so `pnpm` shim lands on PATH.
+  log "Enabling corepack"
+  corepack enable >> "$LOG_FILE" 2>&1 || true
+
+  # On Linux/WSL with system-wide Node (e.g. apt-installed to /usr/bin),
+  # corepack needs root to symlink /usr/bin/pnpm. Retry with sudo when pnpm
+  # isn't on PATH. macOS Homebrew installs land in a user-writable prefix,
+  # and a sudo retry there would create root-owned shims inside /opt/homebrew
+  # that later break brew — so the retry is Linux-only.
+  if ! command -v pnpm >/dev/null 2>&1 && [ "$PLATFORM" = "linux" ] \
+      && command -v sudo >/dev/null 2>&1; then
+    log "pnpm not on PATH after corepack enable — retrying with sudo"
+    sudo corepack enable >> "$LOG_FILE" 2>&1 || true
   fi
 
-  log "Running npm ci $npm_flags"
-  if npm ci $npm_flags >> "$LOG_FILE" 2>&1; then
+  log "Running pnpm install --frozen-lockfile"
+  if pnpm install --frozen-lockfile >> "$LOG_FILE" 2>&1; then
     DEPS_OK="true"
-    log "npm install succeeded"
+    log "pnpm install succeeded"
   else
-    log "npm install failed"
+    log "pnpm install failed"
     return
   fi
 

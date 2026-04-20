@@ -9,32 +9,27 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_URL, TIMEZONE } from './config.js';
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, MAX_MESSAGES_PER_PROMPT, ONECLI_URL, TIMEZONE } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
+import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
-import { stopTypingRefresh } from './delivery.js';
+import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { validateAdditionalMounts } from './mount-security.js';
+import { validateAdditionalMounts } from './modules/mount-security/index.js';
+// Provider host-side config barrel — each provider that needs host-side
+// container setup self-registers on import.
+import './providers/index.js';
 import {
-  markContainerIdle,
-  markContainerRunning,
-  markContainerStopped,
-  sessionDir,
-  writeDestinations,
-  writeSessionRouting,
-} from './session-manager.js';
+  getProviderContainerConfig,
+  type ProviderContainerContribution,
+  type VolumeMount,
+} from './providers/provider-container-registry.js';
+import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
-
-interface VolumeMount {
-  hostPath: string;
-  containerPath: string;
-  readonly: boolean;
-}
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -88,16 +83,25 @@ async function spawnContainer(session: Session): Promise<void> {
   }
 
   // Refresh the destination map and default reply routing so any admin
-  // changes take effect on wake.
-  writeDestinations(agentGroup.id, session.id);
+  // changes take effect on wake. Destinations come from the agent-to-agent
+  // module — skip when the module isn't installed (table absent).
+  if (hasTable(getDb(), 'agent_destinations')) {
+    const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
+    writeDestinations(agentGroup.id, session.id);
+  }
   writeSessionRouting(agentGroup.id, session.id);
 
-  const mounts = buildMounts(agentGroup, session);
+  // Resolve the effective provider + any host-side contribution it declares
+  // (extra mounts, env passthrough). Computed once and threaded through both
+  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  const { provider, contribution } = resolveProviderContribution(session, agentGroup);
+
+  const mounts = buildMounts(agentGroup, session, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(mounts, containerName, session, agentGroup, agentIdentifier);
+  const args = await buildContainerArgs(mounts, containerName, agentGroup, provider, contribution, agentIdentifier);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -116,22 +120,12 @@ async function spawnContainer(session: Session): Promise<void> {
   // stdout is unused in v2 (all IO is via session DB)
   container.stdout?.on('data', () => {});
 
-  // Idle timeout: kill container after IDLE_TIMEOUT of no activity
-  let idleTimer = setTimeout(() => killContainer(session.id, 'idle timeout'), IDLE_TIMEOUT);
-
-  const resetIdle = () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => killContainer(session.id, 'idle timeout'), IDLE_TIMEOUT);
-  };
-
-  // Reset idle timer when the host detects new messages_out (called by delivery.ts)
-  const entry = activeContainers.get(session.id);
-  if (entry) {
-    (entry as { resetIdle?: () => void }).resetIdle = resetIdle;
-  }
+  // No host-side idle timeout. Stale/stuck detection is driven by the host
+  // sweep reading heartbeat mtime + processing_ack claim age + container_state
+  // (see src/host-sweep.ts). This avoids killing long-running legitimate work
+  // on a wall-clock timer.
 
   container.on('close', (code) => {
-    clearTimeout(idleTimer);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
@@ -139,18 +133,11 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 
   container.on('error', (err) => {
-    clearTimeout(idleTimer);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
   });
-}
-
-/** Reset the idle timer for a session's container (called when messages_out are delivered). */
-export function resetContainerIdleTimer(sessionId: string): void {
-  const entry = activeContainers.get(sessionId) as { resetIdle?: () => void } | undefined;
-  entry?.resetIdle?.();
 }
 
 /** Kill a container for a session. */
@@ -166,7 +153,27 @@ export function killContainer(sessionId: string, reason: string): void {
   }
 }
 
-function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
+function resolveProviderContribution(
+  session: Session,
+  agentGroup: AgentGroup,
+): { provider: string; contribution: ProviderContainerContribution } {
+  const provider = (session.agent_provider || agentGroup.agent_provider || 'claude').toLowerCase();
+  const fn = getProviderContainerConfig(provider);
+  const contribution = fn
+    ? fn({
+        sessionDir: sessionDir(agentGroup.id, session.id),
+        agentGroupId: agentGroup.id,
+        hostEnv: process.env,
+      })
+    : {};
+  return { provider, contribution };
+}
+
+function buildMounts(
+  agentGroup: AgentGroup,
+  session: Session,
+  providerContribution: ProviderContainerContribution,
+): VolumeMount[] {
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
   // is a no-op for groups that have spawned before. Pulling in upstream
@@ -208,21 +215,27 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     mounts.push(...validated);
   }
 
+  // Provider-contributed mounts (e.g. opencode-xdg)
+  if (providerContribution.mounts) {
+    mounts.push(...providerContribution.mounts);
+  }
+
   return mounts;
 }
 
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  session: Session,
   agentGroup: AgentGroup,
+  provider: string,
+  providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
 
   // Environment
   args.push('-e', `TZ=${TIMEZONE}`);
-  args.push('-e', `AGENT_PROVIDER=${session.agent_provider || agentGroup.agent_provider || 'claude'}`);
+  args.push('-e', `AGENT_PROVIDER=${provider}`);
   // Two-DB split: container reads inbound.db, writes outbound.db
   args.push('-e', 'SESSION_INBOUND_DB_PATH=/workspace/inbound.db');
   args.push('-e', 'SESSION_OUTBOUND_DB_PATH=/workspace/outbound.db');
@@ -233,14 +246,42 @@ async function buildContainerArgs(
   }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
+  // Cap on how many pending messages reach one prompt. Accumulated context
+  // (trigger=0 rows) rides along with wake-eligible rows up to this cap.
+  args.push('-e', `NANOCLAW_MAX_MESSAGES_PER_PROMPT=${MAX_MESSAGES_PER_PROMPT}`);
+
+  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
+  if (providerContribution.env) {
+    for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
   // agent group. Role changes take effect on next container spawn.
+  //
+  // SQL inlined to keep core independent of the permissions module — we
+  // guard on the `user_roles` table directly. If the permissions module
+  // isn't installed, the table doesn't exist and the set stays empty; the
+  // formatter treats an empty admin set as permissionless mode (every
+  // sender is admin).
   const adminUserIds = new Set<string>();
-  for (const r of getOwners()) adminUserIds.add(r.user_id);
-  for (const r of getGlobalAdmins()) adminUserIds.add(r.user_id);
-  for (const r of getAdminsOfAgentGroup(agentGroup.id)) adminUserIds.add(r.user_id);
+  if (hasTable(getDb(), 'user_roles')) {
+    const db = getDb();
+    const owners = db
+      .prepare("SELECT user_id FROM user_roles WHERE role = 'owner' AND agent_group_id IS NULL")
+      .all() as Array<{ user_id: string }>;
+    const globalAdmins = db
+      .prepare("SELECT user_id FROM user_roles WHERE role = 'admin' AND agent_group_id IS NULL")
+      .all() as Array<{ user_id: string }>;
+    const scopedAdmins = db
+      .prepare("SELECT user_id FROM user_roles WHERE role = 'admin' AND agent_group_id = ?")
+      .all(agentGroup.id) as Array<{ user_id: string }>;
+    for (const r of owners) adminUserIds.add(r.user_id);
+    for (const r of globalAdmins) adminUserIds.add(r.user_id);
+    for (const r of scopedAdmins) adminUserIds.add(r.user_id);
+  }
   if (adminUserIds.size > 0) {
     args.push('-e', `NANOCLAW_ADMIN_USER_IDS=${Array.from(adminUserIds).join(',')}`);
   }
@@ -289,17 +330,17 @@ async function buildContainerArgs(
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(containerConfig.mcpServers)}`);
   }
 
-  // Override entrypoint: compile agent-runner source, run v2 entry point (no stdin)
+  // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
+  // The image's ENTRYPOINT (tini → entrypoint.sh) handles the stdin-piped
+  // invocation path; the host-spawned sessions don't need stdin because all
+  // IO flows through the mounted session DBs.
   args.push('--entrypoint', 'bash');
 
   // Use per-agent-group image if one has been built, otherwise base image
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
   args.push(imageTag);
 
-  args.push(
-    '-c',
-    'cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2 && ln -sf /app/node_modules /tmp/dist/node_modules && node /tmp/dist/index.js',
-  );
+  args.push('-c', 'exec bun run /app/src/index.ts');
 
   return args;
 }
@@ -322,7 +363,12 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     dockerfile += `RUN apt-get update && apt-get install -y ${aptPackages.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
   }
   if (npmPackages.length > 0) {
-    dockerfile += `RUN npm install -g ${npmPackages.join(' ')}\n`;
+    // pnpm skips build scripts unless packages are allowlisted. Append each
+    // to /root/.npmrc (base image sets it up for agent-browser) so packages
+    // with postinstall — e.g. playwright, puppeteer, native addons — don't
+    // install silently broken.
+    const allowlist = npmPackages.map((p) => `echo 'only-built-dependencies[]=${p}' >> /root/.npmrc`).join(' && ');
+    dockerfile += `RUN ${allowlist} && pnpm install -g ${npmPackages.join(' ')}\n`;
   }
   dockerfile += 'USER node\n';
 

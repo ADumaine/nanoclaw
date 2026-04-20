@@ -1,11 +1,20 @@
 import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
+// Transitional tier violation: core imports from optional agent-to-agent module.
+// `createMessagingGroupAgent` auto-creates a destination row on wiring — the
+// two concerns are currently bundled. When agent-to-agent isn't installed,
+// the table doesn't exist and this import chain remains dormant because
+// `createMessagingGroupAgent` is only called from setup/admin paths that
+// also only run when wiring channels to agents (which implicitly requires
+// agent-to-agent for the destination ACL to mean anything). A cleaner split
+// (or making the destination side effect module-owned) is tracked in the
+// refactor plan.
 import {
   createDestination,
   getDestinationByName,
   getDestinationByTarget,
   normalizeName,
-} from './agent-destinations.js';
-import { getDb } from './connection.js';
+} from '../modules/agent-to-agent/db/agent-destinations.js';
+import { getDb, hasTable } from './connection.js';
 
 // ── Messaging Groups ──
 
@@ -26,6 +35,37 @@ export function getMessagingGroupByPlatform(channelType: string, platformId: str
   return getDb()
     .prepare('SELECT * FROM messaging_groups WHERE channel_type = ? AND platform_id = ?')
     .get(channelType, platformId) as MessagingGroup | undefined;
+}
+
+/**
+ * Combined lookup for the router's fast-drop path. Returns the messaging
+ * group (if it exists) and a count of wired agents in one query — lets
+ * `routeInbound` short-circuit messages for unwired / unknown channels
+ * with a single DB read instead of four (mg lookup, sender upsert, agents
+ * lookup, dropped_messages insert).
+ *
+ * Returns `null` when no messaging_groups row exists for this channel.
+ * Returns `{ mg, agentCount: 0 }` when the row exists but has no wired
+ * agents. Uses the `UNIQUE(channel_type, platform_id)` index plus the
+ * `UNIQUE(messaging_group_id, agent_group_id)` index for the JOIN — both
+ * covered by existing SQLite auto-indexes from the UNIQUE constraints.
+ */
+export function getMessagingGroupWithAgentCount(
+  channelType: string,
+  platformId: string,
+): { mg: MessagingGroup; agentCount: number } | null {
+  const row = getDb()
+    .prepare(
+      `SELECT mg.*, COUNT(mga.id) AS agent_count
+         FROM messaging_groups mg
+    LEFT JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
+        WHERE mg.channel_type = ? AND mg.platform_id = ?
+     GROUP BY mg.id`,
+    )
+    .get(channelType, platformId) as (MessagingGroup & { agent_count: number }) | undefined;
+  if (!row) return null;
+  const { agent_count, ...mg } = row;
+  return { mg: mg as MessagingGroup, agentCount: agent_count };
 }
 
 export function getAllMessagingGroups(): MessagingGroup[] {
@@ -60,6 +100,20 @@ export function deleteMessagingGroup(id: string): void {
   getDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(id);
 }
 
+/**
+ * Mark a messaging group as denied by the owner (channel-registration flow).
+ * Future mentions on this channel silently drop until an admin explicitly
+ * wires it via `createMessagingGroupAgent`, which implicitly clears the
+ * denied state by making `agentCount > 0` — the router's denied-channel
+ * check sits on the `agentCount === 0` branch.
+ *
+ * Passing null unsets the flag (used by tests or a future "unblock channel"
+ * admin command).
+ */
+export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): void {
+  getDb().prepare('UPDATE messaging_groups SET denied_at = ? WHERE id = ?').run(deniedAt, id);
+}
+
 // ── Messaging Group Agents ──
 
 /**
@@ -78,27 +132,41 @@ export function deleteMessagingGroup(id: string): void {
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
   getDb()
     .prepare(
-      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, trigger_rules, response_scope, session_mode, priority, created_at)
-       VALUES (@id, @messaging_group_id, @agent_group_id, @trigger_rules, @response_scope, @session_mode, @priority, @created_at)`,
+      `INSERT INTO messaging_group_agents (
+         id, messaging_group_id, agent_group_id,
+         engage_mode, engage_pattern, sender_scope, ignored_message_policy,
+         session_mode, priority, created_at
+       )
+       VALUES (
+         @id, @messaging_group_id, @agent_group_id,
+         @engage_mode, @engage_pattern, @sender_scope, @ignored_message_policy,
+         @session_mode, @priority, @created_at
+       )`,
     )
     .run(mga);
 
   // Auto-create an agent_destinations row so delivery's ACL doesn't block
-  // outbound messages that target this chat.
+  // outbound messages that target this chat. Guarded: when the agent-to-agent
+  // module isn't installed the table doesn't exist — skip silently. Without
+  // the module, the ACL check in delivery is also skipped (same guard), so
+  // channel sends still work.
   //
   // ⚠️  DESTINATION PROJECTION NOTE: this function only writes the central
   // `agent_destinations` row. It does NOT project into any running
   // agent's session inbound.db (see top-of-file invariant in
-  // src/db/agent-destinations.ts). In practice this is fine because the
-  // only real callers are one-shot setup scripts (setup/register.ts,
-  // scripts/init-first-agent.ts, /manage-channels skill) that run in a
-  // separate process from the host. Any already-running container for
-  // `mga.agent_group_id` will keep serving the stale projection until
-  // its next wake (idle timeout or next inbound message) at which
-  // point spawnContainer's writeDestinations call refreshes from central.
-  // If you call this from code that runs INSIDE the host process and
-  // need the refresh to happen immediately, explicitly call
-  // `writeDestinations(mga.agent_group_id, <sessionId>)` afterwards.
+  // src/modules/agent-to-agent/db/agent-destinations.ts). In practice this
+  // is fine because the only real callers are one-shot setup scripts
+  // (setup/register.ts, scripts/init-first-agent.ts, /manage-channels
+  // skill) that run in a separate process from the host. Any already-
+  // running container for `mga.agent_group_id` will keep serving the
+  // stale projection until its next wake (idle timeout or next inbound
+  // message) at which point spawnContainer's writeDestinations call
+  // refreshes from central. If you call this from code that runs INSIDE
+  // the host process and need the refresh to happen immediately,
+  // explicitly call the module's `writeDestinations(mga.agent_group_id,
+  // <sessionId>)` afterwards.
+  if (!hasTable(getDb(), 'agent_destinations')) return;
+
   const existing = getDestinationByTarget(mga.agent_group_id, 'channel', mga.messaging_group_id);
   if (existing) return;
 
@@ -145,7 +213,12 @@ export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefi
 
 export function updateMessagingGroupAgent(
   id: string,
-  updates: Partial<Pick<MessagingGroupAgent, 'trigger_rules' | 'response_scope' | 'session_mode' | 'priority'>>,
+  updates: Partial<
+    Pick<
+      MessagingGroupAgent,
+      'engage_mode' | 'engage_pattern' | 'sender_scope' | 'ignored_message_policy' | 'session_mode' | 'priority'
+    >
+  >,
 ): void {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
