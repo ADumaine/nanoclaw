@@ -19,14 +19,14 @@
  * Inbound (API server → NanoClaw):
  *   POST /message
  *   Header: X-Shared-Secret: <secret>
- *   Body: { community_id, user_id, message, thread_id, role?, display_name? }
+ *   Body: { app_id, user_id, message, thread_id, role?, display_name? }
  *   Response: 202 { status: 'accepted' }
  *
  * Outbound (NanoClaw → API server):
  *   POST <WEBAPP_CALLBACK_URL>
  *   Header: X-Shared-Secret: <secret>
- *   Body (message): { community_id, thread_id, content, source: 'agent', timestamp }
- *   Body (typing):  { community_id, thread_id, type: 'typing', source: 'agent' }
+ *   Body (message): { app_id, thread_id, content, source: 'agent', timestamp }
+ *   Body (typing):  { app_id, thread_id, type: 'typing', source: 'agent' }
  */
 import http from 'http';
 
@@ -101,9 +101,9 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
-      const { community_id, user_id, display_name, role, message, thread_id } = body;
+      const { app_id, user_id, display_name, role, message, thread_id } = body;
 
-      const missing = ['community_id', 'user_id', 'message', 'thread_id'].filter((k) => !body[k]);
+      const missing = ['app_id', 'user_id', 'message', 'thread_id'].filter((k) => !body[k]);
       if (missing.length > 0) {
         log.warn('Webapp: inbound request missing required fields', { missing, from: req.socket.remoteAddress });
         res.writeHead(400).end(JSON.stringify({ error: `Missing required fields: ${missing.join(', ')}` }));
@@ -114,7 +114,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       res.writeHead(202).end(JSON.stringify({ status: 'accepted' }));
 
       // Construct the full platform_id — must match what was registered in the DB
-      const platformId = `${CHANNEL_TYPE}:${community_id}`;
+      const platformId = `${CHANNEL_TYPE}:${app_id}`;
       await setupConfig!.onInbound(platformId, thread_id, {
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         kind: 'chat',
@@ -181,7 +181,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       ): Promise<string | undefined> {
         try {
           return await postCallback({
-            community_id: platformId,
+            app_id: platformId,
             thread_id: threadId,
             content: message.content,
             source: 'agent',
@@ -196,7 +196,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       async setTyping(platformId: string, threadId: string | null): Promise<void> {
         try {
           await postCallback({
-            community_id: platformId,
+            app_id: platformId,
             thread_id: threadId,
             type: 'typing',
             source: 'agent',
