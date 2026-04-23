@@ -180,10 +180,14 @@ registerChannelAdapter(CHANNEL_TYPE, {
         message: OutboundMessage,
       ): Promise<string | undefined> {
         try {
+          const raw = message.content as Record<string, unknown> | null;
+          const contentText: string =
+            typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
           return await postCallback({
             app_id: platformId,
             thread_id: threadId,
-            content: message.content,
+            content: contentText,
+            type: 'message',
             source: 'agent',
             timestamp: new Date().toISOString(),
           });

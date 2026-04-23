@@ -203,6 +203,14 @@ function buildMounts(
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
 
+  // Claude requires a $HOME/.claude.json config file to exist (even if empty).
+  // It lives inside .claude-shared so it survives container image rebuilds.
+  const claudeJsonPath = path.join(claudeDir, '.claude.json');
+  if (!fs.existsSync(claudeJsonPath)) {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({ firstStartTime: new Date().toISOString() }));
+  }
+  mounts.push({ hostPath: claudeJsonPath, containerPath: '/home/node/.claude.json', readonly: false });
+
   // Per-group agent-runner source at /app/src (initialized once at group
   // creation, persistent thereafter — agents can modify their runner)
   const groupRunnerDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'agent-runner-src');
@@ -231,7 +239,7 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName];
+  const args: string[] = ['run', '--rm', '--name', containerName, '--label', 'nanoclaw.managed=true'];
 
   // Environment
   args.push('-e', `TZ=${TIMEZONE}`);

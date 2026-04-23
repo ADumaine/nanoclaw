@@ -59,11 +59,21 @@ export function ensureContainerRuntimeRunning(): void {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(`${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const orphans = output.trim().split('\n').filter(Boolean);
+    // Match by label (preferred — catches containers regardless of name) plus
+    // legacy name-prefix filter for containers spawned before the label was added.
+    const byLabel = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=nanoclaw.managed=true --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
+    const byName = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
+    const seen = new Set<string>();
+    const orphans: string[] = [];
+    for (const name of [...byLabel.trim().split('\n'), ...byName.trim().split('\n')].filter(Boolean)) {
+      if (!seen.has(name)) { seen.add(name); orphans.push(name); }
+    }
     for (const name of orphans) {
       try {
         stopContainer(name);
