@@ -5,6 +5,7 @@
 import { execSync } from 'child_process';
 import os from 'os';
 
+import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
 
 /** The container runtime binary name. */
@@ -56,27 +57,23 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
-/** Kill orphaned NanoClaw containers from previous runs. */
+/**
+ * Kill orphaned NanoClaw containers from THIS install's previous runs.
+ *
+ * Scoped by label `nanoclaw-install=<slug>` so a crash-looping peer install
+ * cannot reap our containers, and we cannot reap theirs. The label is
+ * stamped onto every container at spawn time — see container-runner.ts.
+ */
 export function cleanupOrphans(): void {
   try {
-    // Match by label (preferred — catches containers regardless of name) plus
-    // legacy name-prefix filter for containers spawned before the label was added.
-    const byLabel = execSync(`${CONTAINER_RUNTIME_BIN} ps --filter label=nanoclaw.managed=true --format '{{.Names}}'`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const byName = execSync(`${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const seen = new Set<string>();
-    const orphans: string[] = [];
-    for (const name of [...byLabel.trim().split('\n'), ...byName.trim().split('\n')].filter(Boolean)) {
-      if (!seen.has(name)) {
-        seen.add(name);
-        orphans.push(name);
-      }
-    }
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      },
+    );
+    const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
       try {
         stopContainer(name);
