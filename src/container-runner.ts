@@ -27,7 +27,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
+import { heartbeatPath, markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -126,6 +126,14 @@ async function spawnContainer(session: Session): Promise<void> {
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
+  // Reset heartbeat at spawn time so the sweep's ceiling check sees a fresh
+  // timestamp and doesn't immediately kill the new container due to a stale
+  // heartbeat left by the previous run.
+  try {
+    const hb = heartbeatPath(agentGroup.id, session.id);
+    const now = new Date();
+    fs.utimesSync(hb, now, now);
+  } catch { /* heartbeat file may not exist yet on first spawn — container will create it */ }
 
   // Log stderr
   container.stderr?.on('data', (data) => {
@@ -394,6 +402,13 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Forward CM_* vars from host env so container MCP tools can reach the CM API.
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith('CM_') && value !== undefined) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

@@ -1,5 +1,5 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
+import { getPendingMessages, markProcessing, markCompleted, getProcessingThreadId, peekNextThreadId, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
@@ -242,6 +242,11 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
 
+  // Capture the thread_id of the current batch. All follow-up messages pushed
+  // into this query must belong to the same thread so routing.threadId stays
+  // consistent. Cross-thread messages wait for the next container turn.
+  const initialThreadId = getProcessingThreadId();
+
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
   // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
@@ -251,13 +256,17 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
+    // Peek at the oldest unacked message's thread before calling getPendingMessages()
+    // (which would mutate _currentBatchThreadId). If the next message is from a
+    // different thread, skip it — it will be picked up in the next container turn.
+    // Exception: if the initial batch had no thread_id (null), allow all follow-ups
+    // so that null-thread system triggers don't block real inbound messages.
+    if (initialThreadId !== null) {
+      const nextThread = peekNextThreadId();
+      if (nextThread !== null && nextThread !== initialThreadId) return;
+    }
+
     // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
     const newMessages = getPendingMessages().filter((m) => {
       if (m.kind === 'system') return false;
       if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
@@ -266,6 +275,13 @@ async function processQuery(
     if (newMessages.length > 0) {
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);
+
+      // For null-thread initial batches, update routing.threadId once we get a
+      // real thread_id from a follow-up so dispatchResultText routes correctly.
+      if (routing.threadId === null) {
+        const followUpThread = newMessages.find((m) => m.thread_id !== null)?.thread_id ?? null;
+        if (followUpThread !== null) routing.threadId = followUpThread;
+      }
 
       const prompt = formatMessages(newMessages);
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);

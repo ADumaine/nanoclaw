@@ -39,42 +39,70 @@ function getMaxMessagesPerPrompt(): number {
 }
 
 /**
+ * The thread_id of the message batch currently being processed this turn.
+ *
+ * Set by getPendingMessages() when it selects the batch. Used by
+ * getProcessingThreadId() so resolveRouting can reply to the right thread
+ * in shared-session mode without a cross-DB query.
+ */
+let _currentBatchThreadId: string | null = null;
+
+/**
  * Fetch pending messages that are due for processing.
  * Reads from inbound.db (read-only), filters against processing_ack in outbound.db
  * to skip messages already picked up by this or a previous container run.
  *
- * Returns the most recent `MAX_MESSAGES_PER_PROMPT` pending rows in
- * chronological order, regardless of their `trigger` flag: accumulated
- * context (trigger=0) rides along with the wake-eligible rows so the agent
- * sees the prior context it missed. Host's countDueMessages gates waking on
- * trigger=1 separately (see src/db/session-db.ts).
+ * In shared-session mode, multiple users' messages (with different thread_ids)
+ * all land in the same session. To keep reply routing correct, we process only
+ * the oldest-pending thread per turn. Messages from other threads wait for the
+ * next container run. Thread-less messages (thread_id IS NULL) are treated as
+ * their own group and processed when they are the oldest.
+ *
+ * Returns the most recent `MAX_MESSAGES_PER_PROMPT` pending rows from the
+ * selected thread in chronological order.
  */
 export function getPendingMessages(): MessageInRow[] {
   const inbound = getInboundDb();
   const outbound = getOutboundDb();
 
-  const pending = inbound
-    .prepare(
-      `SELECT * FROM messages_in
-       WHERE status = 'pending'
-         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-       ORDER BY seq DESC
-       LIMIT ?`,
-    )
-    .all(getMaxMessagesPerPrompt()) as MessageInRow[];
-
-  if (pending.length === 0) return [];
-
-  // Filter out messages already acknowledged in outbound.db
+  // Build the set of already-acked message IDs first (completed or processing
+  // from a prior/concurrent run).
   const ackedIds = new Set(
     (outbound.prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
       (r) => r.message_id,
     ),
   );
 
-  // Reverse: we fetched DESC to take the most recent N, but the agent
-  // should see them in chronological order (oldest first).
-  return pending.filter((m) => !ackedIds.has(m.id)).reverse();
+  // Fetch all pending, due messages in chronological order (ASC) so we can
+  // find the oldest unacked one to determine which thread to process.
+  const allPending = inbound
+    .prepare(
+      `SELECT * FROM messages_in
+       WHERE status = 'pending'
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+       ORDER BY seq ASC`,
+    )
+    .all() as MessageInRow[];
+
+  const unacked = allPending.filter((m) => !ackedIds.has(m.id));
+  if (unacked.length === 0) {
+    _currentBatchThreadId = null;
+    return [];
+  }
+
+  // Pick the thread_id of the oldest unacked message. Process only that thread
+  // this turn so every send_message call can route to the correct thread.
+  const targetThreadId = unacked[0].thread_id;
+  _currentBatchThreadId = targetThreadId;
+
+  const batch =
+    targetThreadId !== null
+      ? unacked.filter((m) => m.thread_id === targetThreadId)
+      : unacked.filter((m) => m.thread_id === null);
+
+  // Return the most recent maxMessagesPerPrompt from this thread, oldest first.
+  const max = getMaxMessagesPerPrompt();
+  return batch.length <= max ? batch : batch.slice(batch.length - max);
 }
 
 /** Mark messages as processing — writes to processing_ack in outbound.db. */
@@ -116,6 +144,46 @@ export function getMessageIn(id: string): MessageInRow | undefined {
 }
 
 /**
+ * Return the thread_id for the message batch currently being processed.
+ *
+ * Used by resolveRouting when the session's thread_id is null (shared session
+ * mode). Set by getPendingMessages() at the start of each turn, so it is
+ * always scoped to the current batch rather than scanning all messages_in.
+ */
+export function getProcessingThreadId(): string | null {
+  return _currentBatchThreadId;
+}
+
+/**
+ * Return the thread_id of the oldest unacked pending message without modifying
+ * _currentBatchThreadId. Used by the poll loop's follow-up poller to decide
+ * whether incoming messages belong to the current turn's thread before calling
+ * getPendingMessages() (which would mutate _currentBatchThreadId).
+ */
+export function peekNextThreadId(): string | null {
+  const inbound = getInboundDb();
+  const outbound = getOutboundDb();
+
+  const ackedIds = new Set(
+    (outbound.prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
+      (r) => r.message_id,
+    ),
+  );
+
+  const rows = inbound
+    .prepare(
+      `SELECT id, thread_id FROM messages_in
+       WHERE status = 'pending'
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+       ORDER BY seq ASC`,
+    )
+    .all() as Array<{ id: string; thread_id: string | null }>;
+
+  const first = rows.find((r) => !ackedIds.has(r.id));
+  return first !== undefined ? first.thread_id : null;
+}
+
+/**
  * Find a pending response to a question (by questionId in content).
  * Reads from inbound.db, checks processing_ack to skip already-handled responses.
  */
@@ -135,4 +203,3 @@ export function findQuestionResponse(questionId: string): MessageInRow | undefin
 
   return response;
 }
-

@@ -403,7 +403,12 @@ async function deliverToAgent(
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied response written directly to messages_out.
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+    let inboundRoles: string[] = [];
+    try {
+      const parsed = JSON.parse(event.message.content) as Record<string, unknown>;
+      if (Array.isArray(parsed.roles)) inboundRoles = parsed.roles as string[];
+    } catch {}
+    const gate = gateCommand(event.message.content, userId, agent.agent_group_id, event.channelType, inboundRoles);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;

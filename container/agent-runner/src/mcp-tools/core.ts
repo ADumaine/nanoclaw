@@ -11,6 +11,7 @@ import path from 'path';
 
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { getProcessingThreadId } from '../db/messages-in.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -57,10 +58,14 @@ function resolveRouting(
     // Default: reply to whatever thread/channel this session is bound to.
     const session = getSessionRouting();
     if (session.channel_type && session.platform_id) {
+      // session.thread_id is null in shared session mode (all users share one
+      // session). Fall back to the thread_id from the message currently being
+      // processed so replies go to the right user's thread.
+      const thread_id = session.thread_id ?? getProcessingThreadId();
       return {
         channel_type: session.channel_type,
         platform_id: session.platform_id,
-        thread_id: session.thread_id,
+        thread_id,
         resolvedName: '(current conversation)',
       };
     }
@@ -83,7 +88,7 @@ function resolveRouting(
     const session = getSessionRouting();
     const threadId =
       session.channel_type === dest.channelType && session.platform_id === dest.platformId
-        ? session.thread_id
+        ? (session.thread_id ?? getProcessingThreadId())
         : null;
     return {
       channel_type: dest.channelType!,

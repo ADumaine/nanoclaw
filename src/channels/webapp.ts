@@ -19,8 +19,17 @@
  * Inbound (API server → NanoClaw):
  *   POST /message
  *   Header: X-Shared-Secret: <secret>
- *   Body: { app_id, user_id, message, thread_id, role?, display_name? }
+ *   Body: { app_id, user_id, message, thread_id, display_name?, roles?: string[],
+ *           user_context?: { home_chapter?, home_chapter_country?, expertise?,
+ *                            interests?, badges?, token_budget_remaining? } }
  *   Response: 202 { status: 'accepted' }
+ *
+ *   POST /close
+ *   Header: X-Shared-Secret: <secret>
+ *   Body: { app_id, thread_id }
+ *   Response: 200 { status: 'closed' }
+ *   Call when the user deletes a chat. Kills the container and removes the
+ *   session. Idempotent — returns 200 if the session is already gone.
  *
  * Outbound (NanoClaw → API server):
  *   POST <WEBAPP_CALLBACK_URL>
@@ -28,10 +37,15 @@
  *   Body (message): { app_id, thread_id, content, source: 'agent', timestamp }
  *   Body (typing):  { app_id, thread_id, type: 'typing', source: 'agent' }
  */
+import fs from 'fs';
 import http from 'http';
 
+import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
+import { findSession, deleteSession } from '../db/sessions.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { killContainer } from '../container-runner.js';
+import { sessionDir } from '../session-manager.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 
@@ -54,13 +68,13 @@ registerChannelAdapter(CHANNEL_TYPE, {
     let server: http.Server | null = null;
     let connected = false;
 
-    function parseBody(req: http.IncomingMessage): Promise<Record<string, string>> {
+    function parseBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
       return new Promise((resolve, reject) => {
         let body = '';
         req.on('data', (chunk: Buffer) => (body += chunk));
         req.on('end', () => {
           try {
-            resolve(JSON.parse(body) as Record<string, string>);
+            resolve(JSON.parse(body) as Record<string, unknown>);
           } catch {
             reject(new Error('Invalid JSON'));
           }
@@ -80,11 +94,64 @@ registerChannelAdapter(CHANNEL_TYPE, {
       });
       if (!response.ok) {
         const body = await response.text().catch(() => '');
-        log.warn('Webapp: callback delivery failed', { status: response.status, body });
+        // Typing indicator calls don't carry content; many API servers reject them.
+        // Log at debug to avoid noise, but don't fail — typing is best-effort.
+        if (payload.type === 'typing') {
+          log.debug('Webapp: typing callback rejected (best-effort)', { status: response.status });
+        } else {
+          log.warn('Webapp: callback delivery failed', { status: response.status, body });
+        }
         return undefined;
       }
       const result = (await response.json()) as Record<string, unknown>;
       return typeof result.message_id === 'string' ? result.message_id : undefined;
+    }
+
+    async function handleClose(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+      if (req.headers['x-shared-secret'] !== sharedSecret) {
+        res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      let body: Record<string, unknown>;
+      try {
+        body = await parseBody(req);
+      } catch {
+        res.writeHead(400).end(JSON.stringify({ error: 'Invalid JSON' }));
+        return;
+      }
+
+      const app_id = body.app_id as string | undefined;
+      const thread_id = body.thread_id as string | undefined;
+      if (!app_id || !thread_id) {
+        res.writeHead(400).end(JSON.stringify({ error: 'Missing required fields: app_id, thread_id' }));
+        return;
+      }
+
+      const platformId = `${CHANNEL_TYPE}:${app_id}`;
+      const mg = getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
+      if (!mg) {
+        res.writeHead(404).end(JSON.stringify({ error: 'Messaging group not found' }));
+        return;
+      }
+
+      const session = findSession(mg.id, thread_id);
+      if (!session) {
+        // Already gone — treat as success
+        res.writeHead(200).end(JSON.stringify({ status: 'closed' }));
+        return;
+      }
+
+      killContainer(session.id, 'chat-closed');
+      deleteSession(session.id);
+      try {
+        fs.rmSync(sessionDir(session.agent_group_id, session.id), { recursive: true, force: true });
+      } catch (err) {
+        log.warn('Webapp: failed to remove session dir on close', { sessionId: session.id, err });
+      }
+
+      log.info('Webapp: session closed by API', { sessionId: session.id, threadId: thread_id });
+      res.writeHead(200).end(JSON.stringify({ status: 'closed' }));
     }
 
     async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -93,7 +160,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
-      let body: Record<string, string>;
+      let body: Record<string, unknown>;
       try {
         body = await parseBody(req);
       } catch {
@@ -101,7 +168,13 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
-      const { app_id, user_id, display_name, role, message, thread_id } = body;
+      const app_id = body.app_id as string | undefined;
+      const user_id = body.user_id as string | undefined;
+      const display_name = body.display_name as string | undefined;
+      const message = body.message as string | undefined;
+      const thread_id = body.thread_id as string | undefined;
+      const roles = Array.isArray(body.roles) ? (body.roles as string[]) : body.roles ? [String(body.roles)] : [];
+      const user_context = body.user_context && typeof body.user_context === 'object' ? body.user_context : undefined;
 
       const missing = ['app_id', 'user_id', 'message', 'thread_id'].filter((k) => !body[k]);
       if (missing.length > 0) {
@@ -115,14 +188,15 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
       // Construct the full platform_id — must match what was registered in the DB
       const platformId = `${CHANNEL_TYPE}:${app_id}`;
-      await setupConfig!.onInbound(platformId, thread_id, {
+      await setupConfig!.onInbound(platformId, thread_id!, {
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         kind: 'chat',
         content: {
           text: message,
           senderId: user_id, // router prepends 'webapp:' → 'webapp:<user_id>'
-          senderName: display_name ?? user_id,
-          role: role ?? 'user', // informational — NanoClaw roles set via user_roles table
+          sender: display_name ?? user_id, // 'sender' is what formatter.ts looks for
+          roles, // informational — NanoClaw roles set via user_roles table
+          ...(user_context ? { user_context } : {}),
         },
         timestamp: new Date().toISOString(),
       });
@@ -141,6 +215,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
           try {
             if (req.method === 'POST' && req.url === '/message') {
               await handleMessage(req, res);
+            } else if (req.method === 'POST' && req.url === '/close') {
+              await handleClose(req, res);
             } else if (req.method === 'GET' && req.url === '/health') {
               res.writeHead(200).end(JSON.stringify({ status: 'ok' }));
             } else {
@@ -181,8 +257,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       ): Promise<string | undefined> {
         try {
           const raw = message.content as Record<string, unknown> | null;
-          const contentText: string =
-            typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
+          const contentText: string = typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
           return await postCallback({
             app_id: platformId,
             thread_id: threadId,

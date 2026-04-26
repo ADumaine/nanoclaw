@@ -176,7 +176,12 @@ function formatSingleChat(msg: MessageInRow): string {
       ? ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"`
       : '';
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  const rolesAttr =
+    Array.isArray(content.roles) && content.roles.length > 0
+      ? ` roles="${escapeXml(content.roles.join(','))}"`
+      : '';
+  const userContextBlock = formatUserContext(content.user_context);
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}${rolesAttr}>${replyPrefix}${userContextBlock}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 function formatTaskMessage(msg: MessageInRow): string {
@@ -199,6 +204,27 @@ function formatWebhookMessage(msg: MessageInRow): string {
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
+}
+
+/**
+ * Render enriched user context as a compact self-closing XML tag.
+ * Arrays (expertise, interests, badges) are joined with commas for readability.
+ * Only present when the channel adapter injects it (e.g. the webapp adapter).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatUserContext(ctx: any): string {
+  if (!ctx || typeof ctx !== 'object') return '';
+  const attrs: string[] = [];
+  const str = (v: unknown) => (v != null ? escapeXml(String(v)) : null);
+  const arr = (v: unknown) => (Array.isArray(v) && v.length > 0 ? escapeXml(v.join(',')) : null);
+  if (str(ctx.home_chapter)) attrs.push(`home_chapter="${str(ctx.home_chapter)}"`);
+  if (str(ctx.home_chapter_country)) attrs.push(`home_chapter_country="${str(ctx.home_chapter_country)}"`);
+  if (arr(ctx.expertise)) attrs.push(`expertise="${arr(ctx.expertise)}"`);
+  if (arr(ctx.interests)) attrs.push(`interests="${arr(ctx.interests)}"`);
+  if (arr(ctx.badges)) attrs.push(`badges="${arr(ctx.badges)}"`);
+  if (ctx.token_budget_remaining != null) attrs.push(`token_budget_remaining="${str(ctx.token_budget_remaining)}"`);
+  if (attrs.length === 0) return '';
+  return `\n  <user_context ${attrs.join(' ')} />\n`;
 }
 
 /**

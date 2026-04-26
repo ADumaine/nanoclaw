@@ -77,7 +77,7 @@ async function main(): Promise<void> {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
-      env: {},
+      env: Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined)) as Record<string, string>,
     },
   };
 
