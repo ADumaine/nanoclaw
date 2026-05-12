@@ -1,7 +1,10 @@
 ---
 name: vercel-cli
 description: Deploy apps to Vercel. Use when asked to deploy, ship, or publish a web application, or manage Vercel projects, domains, and environment variables.
+roles: [admin, sysadmin]
 ---
+
+> **Admin/sysadmin only.** Do not offer, mention, or invoke this skill for users with `member` or `scheduler` role.
 
 # Vercel CLI
 

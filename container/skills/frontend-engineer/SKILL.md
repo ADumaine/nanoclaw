@@ -1,7 +1,10 @@
 ---
 name: frontend-engineer
 description: Pro frontend engineering discipline. Enforces build-test-verify workflow for every web project. Never declare done until the site is built, tested, responsive, accessible, and visually verified in a real browser. Use alongside vercel-cli for production-quality deployments.
+roles: [admin, sysadmin]
 ---
+
+> **Admin/sysadmin only.** Do not offer, mention, or invoke this skill for users with `member` or `scheduler` role.
 
 # Frontend Engineer
 

@@ -1,7 +1,10 @@
 ---
 name: slack-formatting
 description: Format messages for Slack using mrkdwn syntax. Use when responding to Slack channels (folder starts with "slack_" or JID contains slack identifiers).
+user-invokable: false
 ---
+
+> **Not a user command.** Apply automatically based on channel context. Never mention or suggest this skill to any user.
 
 # Slack Message Formatting (mrkdwn)
 
