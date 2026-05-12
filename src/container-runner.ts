@@ -20,12 +20,14 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
+import { readEnvPrefix } from './env.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -125,6 +127,11 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
+  // Derive app_id from the session's messaging group platform_id (e.g. "webapp:cryptomondays-dev" → "cryptomondays-dev").
+  // Used to select per-environment CM_* overrides so dev/beta sessions hit their own API server.
+  const mg = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
+  const appId = mg?.platform_id?.includes(':') ? mg.platform_id.split(':')[1] : undefined;
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -133,6 +140,7 @@ async function spawnContainer(session: Session): Promise<void> {
     provider,
     contribution,
     agentIdentifier,
+    appId,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -154,7 +162,9 @@ async function spawnContainer(session: Session): Promise<void> {
     const hb = heartbeatPath(agentGroup.id, session.id);
     const now = new Date();
     fs.utimesSync(hb, now, now);
-  } catch { /* heartbeat file may not exist yet on first spawn — container will create it */ }
+  } catch {
+    /* heartbeat file may not exist yet on first spawn — container will create it */
+  }
 
   // Log stderr
   container.stderr?.on('data', (data) => {
@@ -428,6 +438,19 @@ function ensureRuntimeFields(
   }
 }
 
+function rewriteLocalhostUrl(value: string): string {
+  try {
+    const u = new URL(value);
+    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+      u.hostname = 'host.docker.internal';
+      return u.toString();
+    }
+  } catch {
+    /* not a URL, return as-is */
+  }
+  return value;
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -436,6 +459,7 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
+  appId?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
@@ -444,10 +468,22 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Forward CM_* vars from host env so container MCP tools can reach the CM API.
+  // Per-app_id overrides (CM_API_BASE_URL_<app_id>, CM_API_TOKEN_<app_id>, etc.)
+  // let dev and beta sessions each hit their own API server.
+  // Rewrite localhost/127.0.0.1 URLs → host.docker.internal so containers can
+  // reach host-side services (localhost inside a container is the container itself).
+  const cmOverrides = appId ? readEnvPrefix(`CM_API_BASE_URL_`) : {};
+  const cmTokenOverrides = appId ? readEnvPrefix(`CM_API_TOKEN_`) : {};
+  const cmAgentTokenOverrides = appId ? readEnvPrefix(`CM_AGENT_TOKEN_`) : {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith('CM_') && value !== undefined) {
-      args.push('-e', `${key}=${value}`);
+    if (!key.startsWith('CM_') || value === undefined) continue;
+    let effective = value;
+    if (appId) {
+      if (key === 'CM_API_BASE_URL' && cmOverrides[appId]) effective = cmOverrides[appId];
+      else if (key === 'CM_API_TOKEN' && cmTokenOverrides[appId]) effective = cmTokenOverrides[appId];
+      else if (key === 'CM_AGENT_TOKEN' && cmAgentTokenOverrides[appId]) effective = cmAgentTokenOverrides[appId];
     }
+    args.push('-e', `${key}=${rewriteLocalhostUrl(effective)}`);
   }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
@@ -471,6 +507,40 @@ async function buildContainerArgs(
     }
   } catch (err) {
     log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+  }
+
+  // Bypass the OneCLI proxy for local services that handle their own auth.
+  const noProxyHosts = ['localhost', '127.0.0.1'];
+  const cmApiUrl = process.env.CM_API_BASE_URL;
+  if (cmApiUrl) {
+    try {
+      noProxyHosts.push(new URL(cmApiUrl).hostname);
+    } catch {
+      /* ignore malformed URL */
+    }
+  }
+  // If ANTHROPIC_BASE_URL points to a local LLM proxy it must also bypass OneCLI,
+  // otherwise OneCLI intercepts the request and the proxy never receives it.
+  const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+  if (anthropicBaseUrl) {
+    try {
+      const h = new URL(anthropicBaseUrl).hostname;
+      if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
+    } catch {
+      /* ignore malformed URL */
+    }
+  }
+  const noProxy = noProxyHosts.join(',');
+  args.push('-e', `NO_PROXY=${noProxy}`);
+  args.push('-e', `no_proxy=${noProxy}`);
+
+  // Forward Anthropic endpoint overrides AFTER OneCLI so our values win.
+  // OneCLI sets ANTHROPIC_API_KEY=placeholder as its sentinel; if we're routing
+  // through a local proxy the placeholder never gets substituted, so we must
+  // override it here with the real proxy access token.
+  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']) {
+    const value = process.env[key];
+    if (value !== undefined) args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
   }
 
   // Host gateway

@@ -9,12 +9,16 @@
  * NanoClaw messaging group / agent group pair.
  *
  * Required .env vars:
- *   WEBAPP_SHARED_SECRET   — shared secret between NanoClaw and the API server
- *   WEBAPP_CALLBACK_URL    — URL NanoClaw POSTs responses to (your API server)
+ *   WEBAPP_SHARED_SECRET              — shared secret between NanoClaw and the API server
+ *   WEBAPP_CALLBACK_URL               — default URL NanoClaw POSTs responses to
  *
  * Optional .env vars:
- *   WEBAPP_PORT            — port to listen on (default: 3099)
- *   WEBAPP_BIND_HOST       — bind address (default: 127.0.0.1)
+ *   WEBAPP_PORT                       — port to listen on (default: 3099)
+ *   WEBAPP_BIND_HOST                  — bind address (default: 127.0.0.1)
+ *   WEBAPP_CALLBACK_URL_<app_id>      — per-app_id callback override; takes precedence
+ *                                       over WEBAPP_CALLBACK_URL for that app_id.
+ *                                       Allows multiple API servers (e.g. dev, beta) to
+ *                                       share one NanoClaw instance.
  *
  * Inbound (API server → NanoClaw):
  *   POST /message
@@ -34,7 +38,7 @@
  * Outbound (NanoClaw → API server):
  *   POST <WEBAPP_CALLBACK_URL>
  *   Header: X-Shared-Secret: <secret>
- *   Body (message): { app_id, thread_id, content, source: 'agent', timestamp }
+ *   Body (message): { app_id, thread_id, content, format: 'markdown', source: 'agent', timestamp, tokens_used?, model? }
  *   Body (typing):  { app_id, thread_id, type: 'typing', source: 'agent' }
  */
 import fs from 'fs';
@@ -42,7 +46,7 @@ import http from 'http';
 
 import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSession, deleteSession } from '../db/sessions.js';
-import { readEnvFile } from '../env.js';
+import { readEnvFile, readEnvPrefix } from '../env.js';
 import { log } from '../log.js';
 import { killContainer } from '../container-runner.js';
 import { sessionDir } from '../session-manager.js';
@@ -61,6 +65,9 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
     const sharedSecret = env.WEBAPP_SHARED_SECRET;
     const callbackUrl = env.WEBAPP_CALLBACK_URL;
+    // Per-app_id overrides: WEBAPP_CALLBACK_URL_<app_id>=http://...
+    // Allows dev and beta API servers to share one NanoClaw instance.
+    const callbackUrlOverrides = readEnvPrefix('WEBAPP_CALLBACK_URL_');
     const port = parseInt(env.WEBAPP_PORT ?? String(DEFAULT_PORT), 10);
     const bindHost = env.WEBAPP_BIND_HOST ?? DEFAULT_BIND_HOST;
 
@@ -83,8 +90,11 @@ registerChannelAdapter(CHANNEL_TYPE, {
       });
     }
 
-    async function postCallback(payload: Record<string, unknown>): Promise<string | undefined> {
-      const response = await fetch(callbackUrl, {
+    async function postCallback(
+      payload: Record<string, unknown>,
+      targetUrl = callbackUrl,
+    ): Promise<string | undefined> {
+      const response = await fetch(targetUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -156,6 +166,10 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
     async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
       if (req.headers['x-shared-secret'] !== sharedSecret) {
+        log.warn('Webapp: inbound /message rejected — bad secret', {
+          from: req.socket.remoteAddress,
+          header: req.headers['x-shared-secret'] ? '(present but wrong)' : '(missing)',
+        });
         res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
@@ -164,9 +178,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
       try {
         body = await parseBody(req);
       } catch {
+        log.warn('Webapp: inbound /message rejected — invalid JSON body', { from: req.socket.remoteAddress });
         res.writeHead(400).end(JSON.stringify({ error: 'Invalid JSON' }));
         return;
       }
+
+      log.debug('Webapp: inbound /message body keys', { keys: Object.keys(body) });
 
       const app_id = body.app_id as string | undefined;
       const user_id = body.user_id as string | undefined;
@@ -183,6 +200,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
+      log.info('Webapp: routing message', { app_id, user_id, thread_id, platformId: `webapp:${app_id}` });
+
       // Respond immediately — agent reply arrives asynchronously via callback
       res.writeHead(202).end(JSON.stringify({ status: 'accepted' }));
 
@@ -196,7 +215,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
           senderId: user_id, // router prepends 'webapp:' → 'webapp:<user_id>'
           sender: display_name ?? user_id, // 'sender' is what formatter.ts looks for
           roles, // informational — NanoClaw roles set via user_roles table
-          ...(user_context ? { user_context } : {}),
+          user_context: {
+            ...(user_context ?? {}),
+            // Prefer explicit auth_id from caller (e.g. Telegram resolved to Supabase UUID).
+            // Fall back to user_id so the agent always has something to forward.
+            auth_id: (user_context as Record<string, unknown>)?.auth_id ?? user_id,
+          },
         },
         timestamp: new Date().toISOString(),
       });
@@ -212,6 +236,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
         server = http.createServer(async (req, res) => {
           res.setHeader('Content-Type', 'application/json');
+          log.debug('Webapp: inbound request', { method: req.method, url: req.url, from: req.socket.remoteAddress });
           try {
             if (req.method === 'POST' && req.url === '/message') {
               await handleMessage(req, res);
@@ -258,14 +283,32 @@ registerChannelAdapter(CHANNEL_TYPE, {
         try {
           const raw = message.content as Record<string, unknown> | null;
           const contentText: string = typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
-          return await postCallback({
-            app_id: platformId,
-            thread_id: threadId,
-            content: contentText,
-            type: 'message',
-            source: 'agent',
-            timestamp: new Date().toISOString(),
+          const tokensUsed = typeof raw?.tokens_used === 'number' ? raw.tokens_used : undefined;
+          const model = typeof raw?.model === 'string' ? raw.model : undefined;
+          const appId = platformId.startsWith(`${CHANNEL_TYPE}:`)
+            ? platformId.slice(CHANNEL_TYPE.length + 1)
+            : platformId;
+          const resolvedCallbackUrl = callbackUrlOverrides[appId] ?? callbackUrl;
+          log.info('Webapp deliver raw keys', {
+            keys: raw ? Object.keys(raw) : null,
+            model,
+            tokensUsed,
+            callbackUrl: resolvedCallbackUrl,
           });
+          return await postCallback(
+            {
+              app_id: platformId,
+              thread_id: threadId,
+              content: contentText,
+              format: 'markdown',
+              ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}),
+              ...(model !== undefined ? { model } : {}),
+              type: 'message',
+              source: 'agent',
+              timestamp: new Date().toISOString(),
+            },
+            resolvedCallbackUrl,
+          );
         } catch (err) {
           log.error('Webapp: deliver error', { err, platformId, threadId });
           return undefined;
@@ -274,12 +317,18 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
       async setTyping(platformId: string, threadId: string | null): Promise<void> {
         try {
-          await postCallback({
-            app_id: platformId,
-            thread_id: threadId,
-            type: 'typing',
-            source: 'agent',
-          });
+          const appId = platformId.startsWith(`${CHANNEL_TYPE}:`)
+            ? platformId.slice(CHANNEL_TYPE.length + 1)
+            : platformId;
+          await postCallback(
+            {
+              app_id: platformId,
+              thread_id: threadId,
+              type: 'typing',
+              source: 'agent',
+            },
+            callbackUrlOverrides[appId] ?? callbackUrl,
+          );
         } catch {
           // typing indicators are best-effort
         }
