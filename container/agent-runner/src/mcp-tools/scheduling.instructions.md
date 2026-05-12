@@ -1,5 +1,8 @@
 ## Task scheduling (`schedule_task`)
 
+> **Role gate:** `schedule_task`, `update_task`, `cancel_task`, `pause_task`, and `resume_task` are available to `admin`, `sysadmin`, and `scheduler` roles only. Do not offer or invoke them for `member` role users. If a member asks to schedule something, decline and suggest they contact an admin.
+
+
 For any recurring task, use `schedule_task`. This is the scheduling path — tasks persist across sessions and restarts, and support the pre-task `script` hook described below.
 
 To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
