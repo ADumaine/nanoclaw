@@ -271,7 +271,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: '/usr/local/bin/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
@@ -293,9 +293,14 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      let seenModel: string | undefined = process.env.ANTHROPIC_MODEL;
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
+
+        // Capture model from any message that carries it
+        const msgModel = (message as { model?: string }).model;
+        if (msgModel) seenModel = msgModel;
 
         // Yield activity for every SDK event so the poll loop knows the agent is working
         yield { type: 'activity' };
@@ -304,7 +309,19 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
+          const usage = (message as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
+          const tokensUsed = usage ? (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0) : undefined;
+          // modelUsage is a map of { [modelId]: { input_tokens, output_tokens } } — extract the first key
+          if (!seenModel) {
+            const modelUsage = (message as { modelUsage?: Record<string, unknown> }).modelUsage;
+            log(`[debug] modelUsage: ${JSON.stringify(modelUsage)} | seenModel: ${seenModel}`);
+            if (modelUsage) {
+              const keys = Object.keys(modelUsage);
+              if (keys.length > 0) seenModel = keys[0];
+            }
+          }
+          log(`[debug] yielding result tokensUsed=${tokensUsed} model=${seenModel}`);
+          yield { type: 'result', text, tokensUsed, ...(seenModel ? { model: seenModel } : {}) };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
