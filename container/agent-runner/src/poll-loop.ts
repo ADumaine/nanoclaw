@@ -1,5 +1,5 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, getProcessingThreadId, peekNextThreadId, type MessageInRow } from './db/messages-in.js';
+import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
@@ -276,11 +276,6 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
-
-  // Capture the thread_id of the current batch. All follow-up messages pushed
-  // into this query must belong to the same thread so routing.threadId stays
-  // consistent. Cross-thread messages wait for the next container turn.
-  const initialThreadId = getProcessingThreadId();
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
