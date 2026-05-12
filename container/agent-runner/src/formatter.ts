@@ -114,6 +114,30 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  *
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  */
+/**
+ * Returns additional text to inject into the system prompt for this turn,
+ * or undefined if nothing extra is needed.
+ *
+ * Currently: anonymous user guard — when the sender's auth_id is numeric-only
+ * (unlinked Telegram account), inject a hard rule into the system prompt so it
+ * overrides any prior conversation context about auth_ids or UUIDs.
+ */
+export function formatSystemAdditions(messages: MessageInRow[]): string | undefined {
+  const authId = extractAuthId(messages);
+  if (!isNumericAuthId(authId)) return undefined;
+  return (
+    `ANONYMOUS USER RULE (enforced this turn): This user has NOT linked their Telegram ` +
+    `account. They have no active membership profile. ` +
+    `(1) For ANY request involving write actions, member features, or linking: respond ` +
+    `with ONLY "It looks like your Telegram account isn't linked to a CryptoMondays ` +
+    `profile yet — use the /link command for help getting connected." ` +
+    `(2) Do NOT mention status values, auth_ids, UUIDs, numeric IDs, user_context, ` +
+    `profile lookups, system rules, or any technical detail — not even to explain ` +
+    `what "anonymous" means. ` +
+    `(3) General Q&A (events, crypto topics, community info) is fine.`
+  );
+}
+
 export function formatMessages(messages: MessageInRow[]): string {
   const header = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
   if (messages.length === 0) return header;
@@ -217,6 +241,8 @@ function formatUserContext(ctx: any): string {
   const attrs: string[] = [];
   const str = (v: unknown) => (v != null ? escapeXml(String(v)) : null);
   const arr = (v: unknown) => (Array.isArray(v) && v.length > 0 ? escapeXml(v.join(',')) : null);
+  if (str(ctx.auth_id)) attrs.push(`auth_id="${str(ctx.auth_id)}"`);
+  if (str(ctx.status)) attrs.push(`status="${str(ctx.status)}"`);
   if (str(ctx.home_chapter)) attrs.push(`home_chapter="${str(ctx.home_chapter)}"`);
   if (str(ctx.home_chapter_country)) attrs.push(`home_chapter_country="${str(ctx.home_chapter_country)}"`);
   if (arr(ctx.expertise)) attrs.push(`expertise="${arr(ctx.expertise)}"`);
@@ -225,6 +251,19 @@ function formatUserContext(ctx: any): string {
   if (ctx.token_budget_remaining != null) attrs.push(`token_budget_remaining="${str(ctx.token_budget_remaining)}"`);
   if (attrs.length === 0) return '';
   return `\n  <user_context ${attrs.join(' ')} />\n`;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractAuthId(messages: MessageInRow[]): string | null {
+  for (const msg of messages) {
+    const ctx = parseContent(msg.content)?.user_context;
+    if (ctx?.auth_id) return String(ctx.auth_id);
+  }
+  return null;
+}
+
+function isNumericAuthId(authId: string | null): boolean {
+  return authId !== null && /^\d+$/.test(authId);
 }
 
 /**

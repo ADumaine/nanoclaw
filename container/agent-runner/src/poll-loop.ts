@@ -7,7 +7,7 @@ import {
   migrateLegacyContinuation,
   setContinuation,
 } from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import { formatMessages, formatSystemAdditions, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -160,11 +160,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    const sysAdditions = formatSystemAdditions(keep);
+    const systemContext = sysAdditions
+      ? {
+          instructions:
+            (config.systemContext?.instructions ? config.systemContext.instructions + '\n\n' : '') +
+            sysAdditions,
+        }
+      : config.systemContext;
+
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
-      systemContext: config.systemContext,
+      systemContext,
     });
 
     // Process the query while concurrently polling for new messages
@@ -326,7 +335,7 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          dispatchResultText(event.text, routing, event.tokensUsed, event.model);
         }
       }
     }
@@ -367,7 +376,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext, tokensUsed?: number, model?: string): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -389,7 +398,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, body, routing);
+    sendToDestination(dest, body, routing, tokensUsed, model);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -411,13 +420,13 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: scratchpad }),
+        content: JSON.stringify({ text: scratchpad, ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}), ...(model ? { model } : {}) }),
       });
       return;
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
+      sendToDestination(all[0], scratchpad, routing, tokensUsed, model);
       return;
     }
   }
@@ -431,7 +440,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   }
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext, tokensUsed?: number, model?: string): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Inherit thread_id from the inbound routing context so replies land in the
@@ -444,7 +453,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     platform_id: platformId,
     channel_type: channelType,
     thread_id: routing.threadId,
-    content: JSON.stringify({ text: body }),
+    content: JSON.stringify({ text: body, ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}), ...(model ? { model } : {}) }),
   });
 }
 
