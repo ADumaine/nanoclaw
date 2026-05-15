@@ -29,7 +29,7 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
-import { readEnvPrefix } from './env.js';
+import { readEnvFile, readEnvPrefix } from './env.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -456,11 +456,12 @@ async function buildContainerArgs(
   // let dev and beta sessions each hit their own API server.
   // Rewrite localhost/127.0.0.1 URLs → host.docker.internal so containers can
   // reach host-side services (localhost inside a container is the container itself).
+  const cmBase = readEnvPrefix('CM_');
   const cmOverrides = appId ? readEnvPrefix(`CM_API_BASE_URL_`) : {};
   const cmTokenOverrides = appId ? readEnvPrefix(`CM_API_TOKEN_`) : {};
   const cmAgentTokenOverrides = appId ? readEnvPrefix(`CM_AGENT_TOKEN_`) : {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!key.startsWith('CM_') || value === undefined) continue;
+  for (const [suffix, value] of Object.entries(cmBase)) {
+    const key = `CM_${suffix}`;
     let effective = value;
     if (appId) {
       if (key === 'CM_API_BASE_URL' && cmOverrides[appId]) effective = cmOverrides[appId];
@@ -493,7 +494,7 @@ async function buildContainerArgs(
 
   // Bypass the OneCLI proxy for local services that handle their own auth.
   const noProxyHosts = ['localhost', '127.0.0.1'];
-  const cmApiUrl = process.env.CM_API_BASE_URL;
+  const cmApiUrl = readEnvFile(['CM_API_BASE_URL'])['CM_API_BASE_URL'];
   if (cmApiUrl) {
     try {
       noProxyHosts.push(new URL(cmApiUrl).hostname);

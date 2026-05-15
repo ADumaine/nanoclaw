@@ -183,27 +183,42 @@ registerChannelAdapter(CHANNEL_TYPE, {
         return;
       }
 
-      log.debug('Webapp: inbound /message body keys', { keys: Object.keys(body) });
+      log.info('Webapp: inbound /message body keys', {
+        keys: Object.keys(body),
+        hasQuestionId: !!(body.question_id || body.questionId),
+        hasSelectedOption: !!(body.selected_option || body.selectedOption),
+      });
 
       const app_id = body.app_id as string | undefined;
       const user_id = body.user_id as string | undefined;
       const display_name = body.display_name as string | undefined;
       const message = body.message as string | undefined;
       const thread_id = body.thread_id as string | undefined;
+      const question_id = body.question_id as string | undefined;
+      const selected_option = body.selected_option as string | undefined;
       const roles = Array.isArray(body.roles) ? (body.roles as string[]) : body.roles ? [String(body.roles)] : [];
       const user_context = body.user_context && typeof body.user_context === 'object' ? body.user_context : undefined;
 
-      const missing = ['app_id', 'user_id', 'message', 'thread_id'].filter((k) => !body[k]);
+      const isQuestionResponse = !!(question_id && selected_option);
+      const missing = ['app_id', 'user_id', 'thread_id'].filter((k) => !body[k]);
+      if (!isQuestionResponse && !message) missing.push('message');
       if (missing.length > 0) {
         log.warn('Webapp: inbound request missing required fields', { missing, from: req.socket.remoteAddress });
         res.writeHead(400).end(JSON.stringify({ error: `Missing required fields: ${missing.join(', ')}` }));
         return;
       }
 
-      log.info('Webapp: routing message', { app_id, user_id, thread_id, platformId: `webapp:${app_id}` });
-
       // Respond immediately — agent reply arrives asynchronously via callback
       res.writeHead(202).end(JSON.stringify({ status: 'accepted' }));
+
+      // Question response — unblock the waiting ask_user_question tool call
+      if (isQuestionResponse) {
+        log.info('Webapp: question response received', { question_id, selected_option, user_id });
+        setupConfig!.onAction(question_id, selected_option, `${CHANNEL_TYPE}:${user_id}`);
+        return;
+      }
+
+      log.info('Webapp: routing message', { app_id, user_id, thread_id, platformId: `webapp:${app_id}` });
 
       // Construct the full platform_id — must match what was registered in the DB
       const platformId = `${CHANNEL_TYPE}:${app_id}`;
