@@ -92,7 +92,10 @@ export function updateSession(
 }
 
 export function deleteSession(id: string): void {
-  getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id);
+  const db = getDb();
+  db.prepare('DELETE FROM pending_questions WHERE session_id = ?').run(id);
+  db.prepare('DELETE FROM pending_approvals WHERE session_id = ?').run(id);
+  db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
 }
 
 // ── Pending Questions ──
