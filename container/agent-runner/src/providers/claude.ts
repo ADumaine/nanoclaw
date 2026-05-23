@@ -317,12 +317,15 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
-      let seenModel: string | undefined = process.env.ANTHROPIC_MODEL;
+      // Do not pre-seed from ANTHROPIC_MODEL — the proxy returns the actual model
+      // used and that value should win. ANTHROPIC_MODEL is only a last-resort
+      // fallback if the response carries no model information at all.
+      let seenModel: string | undefined;
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
 
-        // Capture model from any message that carries it
+        // Capture model from any message that carries it (e.g. message_start)
         const msgModel = (message as { model?: string }).model;
         if (msgModel) seenModel = msgModel;
 
@@ -344,6 +347,8 @@ export class ClaudeProvider implements AgentProvider {
               if (keys.length > 0) seenModel = keys[0];
             }
           }
+          // Last resort: fall back to the requested model name from env
+          if (!seenModel) seenModel = process.env.ANTHROPIC_MODEL;
           log(`[debug] yielding result tokensUsed=${tokensUsed} model=${seenModel}`);
           yield { type: 'result', text, tokensUsed, ...(seenModel ? { model: seenModel } : {}) };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {

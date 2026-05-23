@@ -198,6 +198,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       const selected_option = body.selected_option as string | undefined;
       const roles = Array.isArray(body.roles) ? (body.roles as string[]) : body.roles ? [String(body.roles)] : [];
       const user_context = body.user_context && typeof body.user_context === 'object' ? body.user_context : undefined;
+      const llm_mode = typeof body.llm_mode === 'string' ? body.llm_mode : undefined;
 
       const isQuestionResponse = !!(question_id && selected_option);
       const missing = ['app_id', 'user_id', 'thread_id'].filter((k) => !body[k]);
@@ -235,6 +236,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
             // Prefer explicit auth_id from caller (e.g. Telegram resolved to Supabase UUID).
             // Fall back to user_id so the agent always has something to forward.
             auth_id: (user_context as Record<string, unknown>)?.auth_id ?? user_id,
+            ...(llm_mode ? { llm_mode } : {}),
           },
         },
         timestamp: new Date().toISOString(),

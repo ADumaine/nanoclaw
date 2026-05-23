@@ -44,6 +44,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  openInboundDb,
   sessionDir,
   writeSessionRouting,
 } from './session-manager.js';
@@ -107,6 +108,25 @@ export function wakeContainer(session: Session): Promise<boolean> {
   return promise;
 }
 
+function readSessionContext(agentGroupId: string, sessionId: string): { userId?: string; llmMode?: string } {
+  try {
+    const db = openInboundDb(agentGroupId, sessionId);
+    const row = db
+      .prepare("SELECT content FROM messages_in WHERE kind='chat' ORDER BY seq DESC LIMIT 1")
+      .get() as { content: string } | undefined;
+    db.close();
+    if (!row) return {};
+    const content = JSON.parse(row.content) as Record<string, unknown>;
+    const ctx = content.user_context as Record<string, unknown> | undefined;
+    return {
+      userId: typeof ctx?.auth_id === 'string' ? ctx.auth_id : undefined,
+      llmMode: typeof ctx?.llm_mode === 'string' ? ctx.llm_mode : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function spawnContainer(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
@@ -143,6 +163,8 @@ async function spawnContainer(session: Session): Promise<void> {
   const mg = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
   const appId = mg?.platform_id?.includes(':') ? mg.platform_id.split(':')[1] : undefined;
 
+  const sessionContext = readSessionContext(agentGroup.id, session.id);
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -152,6 +174,7 @@ async function spawnContainer(session: Session): Promise<void> {
     contribution,
     agentIdentifier,
     appId,
+    sessionContext,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -444,6 +467,7 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
   appId?: string,
+  sessionContext?: { userId?: string; llmMode?: string },
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
@@ -521,9 +545,18 @@ async function buildContainerArgs(
   // OneCLI sets ANTHROPIC_API_KEY=placeholder as its sentinel; if we're routing
   // through a local proxy the placeholder never gets substituted, so we must
   // override it here with the real proxy access token.
-  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']) {
-    const value = process.env[key];
-    if (value !== undefined) args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
+  // Fall back to .env for keys not exported into the host process environment.
+  // When routing through the LLM proxy and session context is available, encode
+  // llm_mode and user_id into the key so the proxy can resolve user credentials:
+  // ANTHROPIC_API_KEY="<base_key>:<llm_mode>:<user_id>"
+  const anthropicEnv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
+  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL'] as const) {
+    let value = process.env[key] ?? anthropicEnv[key];
+    if (value === undefined) continue;
+    if (key === 'ANTHROPIC_API_KEY' && sessionContext?.llmMode && sessionContext?.userId) {
+      value = `${value}:${sessionContext.llmMode}:${sessionContext.userId}`;
+    }
+    args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
   }
 
   // Host gateway
