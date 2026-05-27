@@ -111,9 +111,9 @@ export function wakeContainer(session: Session): Promise<boolean> {
 function readSessionContext(agentGroupId: string, sessionId: string): { userId?: string; llmMode?: string } {
   try {
     const db = openInboundDb(agentGroupId, sessionId);
-    const row = db
-      .prepare("SELECT content FROM messages_in WHERE kind='chat' ORDER BY seq DESC LIMIT 1")
-      .get() as { content: string } | undefined;
+    const row = db.prepare("SELECT content FROM messages_in WHERE kind='chat' ORDER BY seq DESC LIMIT 1").get() as
+      | { content: string }
+      | undefined;
     db.close();
     if (!row) return {};
     const content = JSON.parse(row.content) as Record<string, unknown>;

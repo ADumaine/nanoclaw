@@ -21,6 +21,7 @@ import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const BASE_URL = process.env.CM_API_BASE_URL?.replace(/\/$/, '');
+const APP_URL = process.env.CM_APP_URL?.replace(/\/$/, '') ?? '';
 // CM_AGENT_TOKEN is the NanoClaw shared secret — API server assigns system_agent role.
 // Falls back to CM_API_TOKEN for deployments that haven't set CM_AGENT_TOKEN yet.
 const API_TOKEN = process.env.CM_AGENT_TOKEN ?? process.env.CM_API_TOKEN;
@@ -214,7 +215,7 @@ if (!BASE_URL) {
             const meta: string[] = [];
             if (date) meta.push(date);
             if (v.list) meta.push(v.list);
-            const summaryLink = v.has_summary ? ` · [View Summary](/video/summary?id=${v.id})` : '';
+            const summaryLink = v.has_summary ? ` · [View Summary](${APP_URL}/video/summary?id=${v.id})` : '';
             return `${titlePart}${meta.length ? ' — ' + meta.join(' · ') : ''}${summaryLink}`;
           });
 
