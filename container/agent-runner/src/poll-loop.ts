@@ -388,6 +388,23 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
+          // The SDK synthesizes an "API Error: NNN..." result after retry exhaustion.
+          // Detect it, extract the real error, and deliver it directly rather than
+          // passing it to the agent or triggering the unwrap nudge.
+          if (/^API Error:/i.test(event.text) && event.tokensUsed === 0) {
+            const embedded = event.text.match(/"error"\s*:\s*"([^"]+)"/);
+            const detail = embedded ? embedded[1] : event.text.split('\n')[0];
+            writeMessageOut({
+              id: generateId(),
+              kind: 'chat',
+              platform_id: routing.platformId,
+              channel_type: routing.channelType,
+              thread_id: routing.threadId,
+              content: JSON.stringify({ text: `Error: ${detail}` }),
+            });
+            query.end();
+            break;
+          }
           const { hasUnwrapped } = dispatchResultText(event.text, routing, event.tokensUsed, event.model);
           if (hasUnwrapped && !unwrappedNudged) {
             unwrappedNudged = true;

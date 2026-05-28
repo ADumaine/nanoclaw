@@ -290,7 +290,7 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/usr/local/bin/claude',
-        systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
+        systemPrompt: instructions || undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
@@ -351,6 +351,24 @@ export class ClaudeProvider implements AgentProvider {
           if (!seenModel) seenModel = process.env.ANTHROPIC_MODEL;
           log(`[debug] yielding result tokensUsed=${tokensUsed} model=${seenModel}`);
           yield { type: 'result', text, tokensUsed, ...(seenModel ? { model: seenModel } : {}) };
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_error') {
+          const apiErr = message as {
+            error?: { status?: number; message?: string; error?: { message?: string } };
+            retryAttempt?: number;
+            maxRetries?: number;
+          };
+          const status = apiErr.error?.status;
+          const isRetrying =
+            typeof apiErr.retryAttempt === 'number' && apiErr.retryAttempt < (apiErr.maxRetries ?? Infinity);
+          if (!isRetrying) {
+            const detail =
+              apiErr.error?.error?.message ?? apiErr.error?.message ?? `HTTP ${status ?? 'unknown'}`;
+            if (status === 400) {
+              throw new Error(`API error (400): ${detail}`);
+            } else if (typeof apiErr.retryAttempt === 'number' && apiErr.retryAttempt === apiErr.maxRetries) {
+              throw new Error(`API error (${status ?? 'unknown'}) after ${apiErr.maxRetries} retries: ${detail}`);
+            }
+          }
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
