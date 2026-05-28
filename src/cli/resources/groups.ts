@@ -28,6 +28,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    disabled_modules: JSON.parse(row.disabled_modules),
     updated_at: row.updated_at,
   };
 }
@@ -367,6 +368,48 @@ registerResource({
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
         };
+      },
+    },
+    'config add-disabled-module': {
+      access: 'approval',
+      description:
+        'Suppress a built-in module fragment for a group (e.g. self-mod, agents, scheduling). ' +
+        'Requires `ncl groups restart` to take effect. Use --id <group-id> --name <module-name>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const name = args.name as string;
+        if (!name) throw new Error('--name is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const existing = JSON.parse(row.disabled_modules) as string[];
+        if (!existing.includes(name)) {
+          existing.push(name);
+          updateContainerConfigJson(id, 'disabled_modules', existing);
+        }
+        return { disabled_modules: existing };
+      },
+    },
+    'config remove-disabled-module': {
+      access: 'approval',
+      description:
+        'Re-enable a previously suppressed built-in module fragment for a group. ' +
+        'Requires `ncl groups restart` to take effect. Use --id <group-id> --name <module-name>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const name = args.name as string;
+        if (!name) throw new Error('--name is required');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const existing = JSON.parse(row.disabled_modules) as string[];
+        const filtered = existing.filter((m) => m !== name);
+        updateContainerConfigJson(id, 'disabled_modules', filtered);
+        return { disabled_modules: filtered };
       },
     },
   },
