@@ -24,15 +24,25 @@ function log(msg: string): void {
 // - EnterPlanMode / ExitPlanMode / EnterWorktree / ExitWorktree: Claude
 //   Code UI affordances; in a headless container they'd appear stuck.
 const SDK_DISALLOWED_TOOLS = [
+  // Scheduling — use mcp__nanoclaw__schedule_task instead.
   'CronCreate',
   'CronDelete',
   'CronList',
   'ScheduleWakeup',
+  // UI affordances that hang in a headless container.
   'AskUserQuestion',
   'EnterPlanMode',
   'ExitPlanMode',
   'EnterWorktree',
   'ExitWorktree',
+  // TeamCreate/TeamDelete spawn named agent teams that each make independent
+  // API calls through the compound key — unbounded token multiplication risk.
+  // NotebookEdit has no use case in current agent groups.
+  // Disallowed (not just omitted from allowedTools) so the definitions are
+  // suppressed from the system prompt entirely, not just blocked at call time.
+  'TeamCreate',
+  'TeamDelete',
+  'NotebookEdit',
 ];
 
 // Tool allowlist for NanoClaw agent containers. MCP-tool entries are derived
