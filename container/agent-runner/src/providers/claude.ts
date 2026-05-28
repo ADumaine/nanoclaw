@@ -40,6 +40,13 @@ const SDK_DISALLOWED_TOOLS = [
 // added via `add_mcp_server` (or wired in container.json directly) is
 // reachable to the agent — without this, the SDK's allowedTools filter
 // silently drops every MCP namespace not listed here.
+// TeamCreate/TeamDelete and NotebookEdit are intentionally excluded:
+// TeamCreate spins up named persistent agent teams that each make independent
+// API calls through the compound key — a user can prompt the agent into
+// multiplying token consumption with no hard stop. NotebookEdit has no use
+// case in current agent groups. Task/TaskOutput/TaskStop are kept because
+// they spawn in-process sub-agents within a single turn and are useful for
+// parallelising research (e.g. chapter admin workflows).
 const TOOL_ALLOWLIST = [
   'Bash',
   'Read',
@@ -52,13 +59,10 @@ const TOOL_ALLOWLIST = [
   'Task',
   'TaskOutput',
   'TaskStop',
-  'TeamCreate',
-  'TeamDelete',
   'SendMessage',
   'TodoWrite',
   'ToolSearch',
   'Skill',
-  'NotebookEdit',
 ];
 
 // MCP server names are sanitized by the SDK when forming tool prefixes:
