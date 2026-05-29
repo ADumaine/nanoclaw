@@ -65,9 +65,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
         return parsed === 'all' ? 'all' : new Set(parsed);
       })()
     : 'all';
-  const disabledModules = new Set<string>(
-    configRow ? (JSON.parse(configRow.disabled_modules) as string[]) : [],
-  );
+  const disabledModules = new Set<string>(configRow ? (JSON.parse(configRow.disabled_modules) as string[]) : []);
   const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
 
   // Skill fragments — only skills in the container config's skill selection

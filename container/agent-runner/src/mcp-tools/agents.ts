@@ -9,7 +9,7 @@
  * (see mcp-tools/index.ts). The host re-checks permission on receive.
  */
 import { writeMessageOut } from '../db/messages-out.js';
-import { registerTools } from './server.js';
+import { registerHiddenTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
@@ -63,4 +63,4 @@ export const createAgent: McpToolDefinition = {
   },
 };
 
-registerTools([createAgent]);
+registerHiddenTools([createAgent]);

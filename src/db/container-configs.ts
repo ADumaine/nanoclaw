@@ -17,6 +17,7 @@ const JSON_COLUMNS = new Set([
   'packages_npm',
   'additional_mounts',
   'disabled_modules',
+  'allowed_tools',
 ]);
 
 export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
@@ -89,7 +90,14 @@ export function updateContainerConfigScalars(
 /** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts. */
 export function updateContainerConfigJson(
   agentGroupId: string,
-  column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts' | 'disabled_modules',
+  column:
+    | 'skills'
+    | 'mcp_servers'
+    | 'packages_apt'
+    | 'packages_npm'
+    | 'additional_mounts'
+    | 'disabled_modules'
+    | 'allowed_tools',
   value: unknown,
 ): void {
   if (!JSON_COLUMNS.has(column)) throw new Error(`Invalid JSON column: ${column}`);

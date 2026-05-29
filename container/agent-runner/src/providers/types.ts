@@ -50,6 +50,11 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * Per-group SDK built-in tool allowlist. When set, replaces the provider's
+   * global TOOL_ALLOWLIST. MCP server wildcards are always appended regardless.
+   */
+  allowedTools?: string[];
 }
 
 export interface QueryInput {

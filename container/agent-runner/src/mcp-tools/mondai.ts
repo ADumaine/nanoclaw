@@ -17,7 +17,7 @@
  *   update_chapter        — update chapter description, co-organizers, links (lead or admin)
  *   send_email            — send an email via the API server (Mailgun) to one or more recipients
  */
-import { registerTools } from './server.js';
+import { registerHiddenTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const BASE_URL = process.env.CM_API_BASE_URL?.replace(/\/$/, '');
@@ -444,5 +444,5 @@ If the recipient count exceeds 5, explicitly ask for confirmation ("You are abou
     },
   ];
 
-  registerTools(tools);
+  registerHiddenTools(tools);
 }

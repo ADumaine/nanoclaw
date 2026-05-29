@@ -26,6 +26,7 @@ export interface ContainerConfigRow {
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
   disabled_modules: string; // JSON: string[] — module fragment names to suppress (e.g. 'self-mod', 'agents')
+  allowed_tools: string; // JSON: '"all"' | '["Tool1","Tool2"]' — SDK built-in tool allowlist for this group
   updated_at: string;
 }
 

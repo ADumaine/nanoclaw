@@ -351,6 +351,7 @@ export class ClaudeProvider implements AgentProvider {
   private additionalDirectories?: string[];
   private model?: string;
   private effort?: string;
+  private allowedTools?: string[];
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
@@ -358,6 +359,7 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
     this.effort = options.effort;
+    this.allowedTools = options.allowedTools;
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -410,6 +412,14 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    // allowedTools only blocks at call time — it does NOT suppress tool definitions
+    // from the system prompt. To actually remove definitions, we must add excluded
+    // SDK built-ins to disallowedTools. This is the same mechanism used for
+    // TeamCreate/TeamDelete: disallowedTools suppresses the definition entirely.
+    const perGroupExcluded = this.allowedTools
+      ? TOOL_ALLOWLIST.filter((t) => !this.allowedTools!.includes(t))
+      : [];
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -419,10 +429,10 @@ export class ClaudeProvider implements AgentProvider {
         pathToClaudeCodeExecutable: '/usr/local/bin/claude',
         systemPrompt: instructions || undefined,
         allowedTools: [
-          ...TOOL_ALLOWLIST,
+          ...(this.allowedTools ?? TOOL_ALLOWLIST),
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
-        disallowedTools: SDK_DISALLOWED_TOOLS,
+        disallowedTools: [...SDK_DISALLOWED_TOOLS, ...perGroupExcluded],
         env: this.env,
         model: this.model,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any

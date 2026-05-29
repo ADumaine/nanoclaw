@@ -18,6 +18,8 @@ export interface RunnerConfig {
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
   model?: string;
   effort?: string;
+  /** Per-group SDK built-in tool allowlist. Absent means use the provider's global default. */
+  allowedTools?: string[];
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -38,6 +40,7 @@ export function loadConfig(): RunnerConfig {
     console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
   }
 
+  const rawAllowedTools = raw.allowedTools as string[] | 'all' | undefined;
   _config = {
     provider: (raw.provider as string) || 'claude',
     assistantName: (raw.assistantName as string) || '',
@@ -47,6 +50,7 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    allowedTools: Array.isArray(rawAllowedTools) ? rawAllowedTools : undefined,
   };
 
   return _config;

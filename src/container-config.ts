@@ -43,10 +43,13 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
   model?: string;
   effort?: string;
+  /** Per-group SDK built-in tool allowlist. 'all' means use the global TOOL_ALLOWLIST. */
+  allowedTools?: string[] | 'all';
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+  const allowedTools = JSON.parse(row.allowed_tools ?? '"all"') as string[] | 'all';
   return {
     mcpServers: JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>,
     packages: {
@@ -63,6 +66,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    allowedTools: allowedTools === 'all' ? undefined : allowedTools,
   };
 }
 

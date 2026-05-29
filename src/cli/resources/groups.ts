@@ -29,6 +29,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     disabled_modules: JSON.parse(row.disabled_modules),
+    allowed_tools: JSON.parse(row.allowed_tools ?? '"all"'),
     updated_at: row.updated_at,
   };
 }
@@ -410,6 +411,31 @@ registerResource({
         const filtered = existing.filter((m) => m !== name);
         updateContainerConfigJson(id, 'disabled_modules', filtered);
         return { disabled_modules: filtered };
+      },
+    },
+    'config set-allowed-tools': {
+      access: 'approval',
+      description:
+        'Set the SDK built-in tool allowlist for a group. Pass --tools as a comma-separated list (e.g. "WebSearch,WebFetch,SendMessage") or --tools all to restore the global default. ' +
+        'Requires `ncl groups restart` to take effect.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const toolsArg = args.tools as string;
+        if (!toolsArg) throw new Error('--tools is required (comma-separated tool names or "all")');
+
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const value: string[] | 'all' =
+          toolsArg.trim() === 'all'
+            ? 'all'
+            : toolsArg
+                .split(',')
+                .map((t) => t.trim())
+                .filter(Boolean);
+        updateContainerConfigJson(id, 'allowed_tools', value);
+        return { allowed_tools: value };
       },
     },
   },
