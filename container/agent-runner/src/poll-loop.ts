@@ -569,6 +569,9 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
+  // Fall back to routing.threadId when the resolved destination thread is null
+  // (e.g. shared-mode sessions where session_routing.thread_id=null causes
+  // ask_user_question responses to lose the originating thread_id).
   const destRouting = resolveDestinationThread(channelType, platformId);
   writeMessageOut({
     id: generateId(),
@@ -576,7 +579,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: destRouting?.threadId ?? null,
+    thread_id: destRouting?.threadId ?? routing.threadId ?? null,
     content: JSON.stringify({ text: body, ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}), ...(model ? { model } : {}) }),
   });
 }
