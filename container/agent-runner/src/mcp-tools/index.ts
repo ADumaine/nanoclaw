@@ -10,11 +10,8 @@ import './scheduling.js';
 import './interactive.js';
 import './agents.js';
 import './self-mod.js';
-// mondai.ts and opportunities.ts register as hidden tools (accessible via the proxy, not listed directly).
-// mondai-proxy.ts registers discover_tools + call_tool as the visible MCP interface.
 import './mondai.js';
 import './opportunities.js';
-import './mondai-proxy.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {

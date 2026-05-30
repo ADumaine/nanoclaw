@@ -18,7 +18,7 @@
  *   update_opportunity_type   — admin: rename/reorder a type
  *   delete_opportunity_type   — admin: remove a type
  */
-import { registerHiddenTools } from './server.js';
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const BASE_URL = process.env.CM_API_BASE_URL?.replace(/\/$/, '');
@@ -359,5 +359,5 @@ if (BASE_URL) {
     },
   ];
 
-  registerHiddenTools(tools);
+  registerTools(tools);
 }
