@@ -23,7 +23,8 @@ import {
 } from './config.js';
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
-import { updateContainerConfigScalars } from './db/container-configs.js';
+import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -31,6 +32,7 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
+import { readEnvFile, readEnvPrefix } from './env.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
@@ -46,6 +48,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  openInboundDb,
   sessionDir,
   writeSessionRouting,
 } from './session-manager.js';
@@ -109,6 +112,25 @@ export function wakeContainer(session: Session): Promise<boolean> {
   return promise;
 }
 
+function readSessionContext(agentGroupId: string, sessionId: string): { userId?: string; llmMode?: string } {
+  try {
+    const db = openInboundDb(agentGroupId, sessionId);
+    const row = db.prepare("SELECT content FROM messages_in WHERE kind='chat' ORDER BY seq DESC LIMIT 1").get() as
+      | { content: string }
+      | undefined;
+    db.close();
+    if (!row) return {};
+    const content = JSON.parse(row.content) as Record<string, unknown>;
+    const ctx = content.user_context as Record<string, unknown> | undefined;
+    return {
+      userId: typeof ctx?.auth_id === 'string' ? ctx.auth_id : undefined,
+      llmMode: typeof ctx?.llm_mode === 'string' ? ctx.llm_mode : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function spawnContainer(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
@@ -147,6 +169,23 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
+
+  // Derive appId from messaging group platform_id for CM_* env overrides
+  let appId: string | undefined;
+  if (session.messaging_group_id) {
+    try {
+      const messagingGroup = getMessagingGroup(session.messaging_group_id);
+      if (messagingGroup?.platform_id) {
+        appId = messagingGroup.platform_id;
+      }
+    } catch {
+      // Fall through, appId remains undefined
+    }
+  }
+
+  // Read session context (user_context from last message) for LLM proxy key encoding
+  const sessionContext = readSessionContext(agentGroup.id, session.id);
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -155,6 +194,8 @@ async function spawnContainer(session: Session): Promise<void> {
     provider,
     contribution,
     agentIdentifier,
+    appId,
+    sessionContext,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -425,27 +466,59 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     : [];
 }
 
+function rewriteLocalhostUrl(value: string): string {
+  try {
+    const u = new URL(value);
+    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
+      u.hostname = 'host.docker.internal';
+      return u.toString();
+    }
+  } catch {
+    /* not a URL, return as-is */
+  }
+  return value;
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  _provider: string,
+  provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
+  appId?: string,
+  sessionContext?: { userId?: string; llmMode?: string },
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
-  // Only --memory is set. Whether that's a hard cap depends on the host having no
-  // swap (a deployment concern) — on a swapless host --memory is hard and a runaway
-  // is OOM-killed; we don't manage swap from here.
   if (CONTAINER_CPU_LIMIT) args.push('--cpus', CONTAINER_CPU_LIMIT);
   if (CONTAINER_MEMORY_LIMIT) args.push('--memory', CONTAINER_MEMORY_LIMIT);
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Forward CM_* vars from host env so container MCP tools can reach the CM API.
+  // Per-app_id overrides (CM_API_BASE_URL_<app_id>, CM_API_TOKEN_<app_id>, etc.)
+  // let dev and beta sessions each hit their own API server.
+  // Rewrite localhost/127.0.0.1 URLs → host.docker.internal so containers can
+  // reach host-side services (localhost inside a container is the container itself).
+  const cmBase = readEnvPrefix('CM_');
+  const cmOverrides = appId ? readEnvPrefix(`CM_API_BASE_URL_`) : {};
+  const cmTokenOverrides = appId ? readEnvPrefix(`CM_API_TOKEN_`) : {};
+  const cmAgentTokenOverrides = appId ? readEnvPrefix(`CM_AGENT_TOKEN_`) : {};
+  for (const [suffix, value] of Object.entries(cmBase)) {
+    const key = `CM_${suffix}`;
+    let effective = value;
+    if (appId) {
+      if (key === 'CM_API_BASE_URL' && cmOverrides[appId]) effective = cmOverrides[appId];
+      else if (key === 'CM_API_TOKEN' && cmTokenOverrides[appId]) effective = cmTokenOverrides[appId];
+      else if (key === 'CM_AGENT_TOKEN' && cmAgentTokenOverrides[appId]) effective = cmAgentTokenOverrides[appId];
+    }
+    args.push('-e', `${key}=${rewriteLocalhostUrl(effective)}`);
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
@@ -461,6 +534,46 @@ async function buildContainerArgs(
     log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
   } else {
     args.push(...hostGatewayArgs());
+  }
+
+  // Bypass the OneCLI proxy for local services that handle their own auth.
+  const noProxyHosts = ['localhost', '127.0.0.1'];
+  const cmApiUrl = readEnvFile(['CM_API_BASE_URL'])['CM_API_BASE_URL'];
+  if (cmApiUrl) {
+    try {
+      noProxyHosts.push(new URL(cmApiUrl).hostname);
+    } catch {
+      /* ignore malformed URL */
+    }
+  }
+  // If ANTHROPIC_BASE_URL points to a local LLM proxy it must also bypass OneCLI,
+  // otherwise OneCLI intercepts the request and the proxy never receives it.
+  const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+  if (anthropicBaseUrl) {
+    try {
+      const h = new URL(anthropicBaseUrl).hostname;
+      if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
+    } catch {
+      /* ignore malformed URL */
+    }
+  }
+  const noProxy = noProxyHosts.join(',');
+  args.push('-e', `NO_PROXY=${noProxy}`);
+  args.push('-e', `no_proxy=${noProxy}`);
+
+  // Forward Anthropic endpoint overrides so our values win over any OneCLI sentinel.
+  // Fall back to .env for keys not exported into the host process environment.
+  // When routing through the LLM proxy and session context is available, encode
+  // llm_mode and user_id into the key so the proxy can resolve user credentials:
+  // ANTHROPIC_API_KEY="<base_key>:<llm_mode>:<user_id>"
+  const anthropicEnv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
+  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL'] as const) {
+    let value = process.env[key] ?? anthropicEnv[key];
+    if (value === undefined) continue;
+    if (key === 'ANTHROPIC_API_KEY' && sessionContext?.llmMode && sessionContext?.userId) {
+      value = `${value}:${sessionContext.llmMode}:${sessionContext.userId}`;
+    }
+    args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
   }
 
   // User mapping

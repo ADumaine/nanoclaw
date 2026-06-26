@@ -30,7 +30,7 @@ import type Database from 'better-sqlite3';
 import fs from 'fs';
 
 import { ensureEgressNetwork } from './egress-lockdown.js';
-import { getActiveSessions } from './db/sessions.js';
+import { getActiveSessions, deleteSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
@@ -44,7 +44,14 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
+import {
+  openInboundDb,
+  openOutboundDb,
+  openOutboundDbRw,
+  inboundDbPath,
+  heartbeatPath,
+  sessionDir,
+} from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
@@ -60,6 +67,12 @@ export function parseSqliteUtc(s: string): number {
 }
 
 const SWEEP_INTERVAL_MS = 60_000;
+// Idle sessions older than this are cleaned up automatically. Override with
+// SESSION_TTL_HOURS env var. Default: 24 hours.
+const SESSION_TTL_MS = (() => {
+  const h = parseFloat(process.env.SESSION_TTL_HOURS ?? '');
+  return Number.isFinite(h) && h > 0 ? h * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+})();
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
@@ -148,6 +161,7 @@ async function sweep(): Promise<void> {
     for (const session of sessions) {
       await sweepSession(session);
     }
+    sweepStaleSessions(sessions);
   } catch (err) {
     log.error('Host sweep error', { err });
   }
@@ -353,5 +367,27 @@ function resetStuckProcessingRows(
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   } finally {
     if (ownsDb) useDb?.close();
+  }
+}
+
+function sweepStaleSessions(sessions: Session[]): void {
+  const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
+  for (const session of sessions) {
+    const lastActive = session.last_active ?? session.created_at;
+    if (!lastActive || lastActive > cutoff) continue;
+
+    log.info('TTL sweep: removing stale session', {
+      sessionId: session.id,
+      lastActive,
+      ttlHours: SESSION_TTL_MS / 3_600_000,
+    });
+
+    killContainer(session.id, 'ttl-expired');
+    deleteSession(session.id);
+    try {
+      fs.rmSync(sessionDir(session.agent_group_id, session.id), { recursive: true, force: true });
+    } catch (err) {
+      log.warn('TTL sweep: failed to remove session dir', { sessionId: session.id, err });
+    }
   }
 }

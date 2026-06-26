@@ -21,6 +21,11 @@ function log(msg: string): void {
 const allTools: McpToolDefinition[] = [];
 const toolMap = new Map<string, McpToolDefinition>();
 
+// Hidden tools are not advertised via ListTools but are callable through the
+// discover_tools / call_tool proxy. This keeps domain tools out of the agent's
+// tool context while still making them reachable on demand.
+const hiddenToolMap = new Map<string, McpToolDefinition>();
+
 export function registerTools(tools: McpToolDefinition[]): void {
   for (const t of tools) {
     if (toolMap.has(t.tool.name)) {
@@ -30,6 +35,32 @@ export function registerTools(tools: McpToolDefinition[]): void {
     allTools.push(t);
     toolMap.set(t.tool.name, t);
   }
+}
+
+/** Register tools that are callable via the proxy but not listed in ListTools. */
+export function registerHiddenTools(tools: McpToolDefinition[]): void {
+  for (const t of tools) {
+    if (hiddenToolMap.has(t.tool.name)) {
+      log(`Warning: hidden tool "${t.tool.name}" already registered, skipping duplicate`);
+      continue;
+    }
+    hiddenToolMap.set(t.tool.name, t);
+  }
+}
+
+/** Get all hidden tool definitions (for discover_tools). */
+export function getHiddenToolDefinitions(): McpToolDefinition[] {
+  return Array.from(hiddenToolMap.values());
+}
+
+/** Call a hidden tool by name. Returns null if the tool is not found. */
+export async function callHiddenTool(
+  name: string,
+  args: Record<string, unknown>,
+): Promise<ReturnType<McpToolDefinition['handler']> | null> {
+  const tool = hiddenToolMap.get(name);
+  if (!tool) return null;
+  return tool.handler(args);
 }
 
 export async function startMcpServer(): Promise<void> {

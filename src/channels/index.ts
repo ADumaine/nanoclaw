@@ -7,3 +7,6 @@
 // self-registration import below.
 
 import './cli.js';
+
+// webapp (native HTTP bridge for custom web frontends)
+import './webapp.js';

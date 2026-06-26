@@ -43,6 +43,8 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
   model?: string;
   effort?: string;
+  disabledModules?: string[];
+  allowedTools?: string[] | 'all';
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
@@ -63,6 +65,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    disabledModules: JSON.parse(row.disabled_modules) as string[],
+    allowedTools: JSON.parse(row.allowed_tools) as string[] | 'all',
   };
 }
 

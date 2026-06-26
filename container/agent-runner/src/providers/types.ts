@@ -79,6 +79,11 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * Allowed tools. If undefined, all tools are allowed. If an array, only
+   * these tools are made available. If 'all', all tools are allowed (same as undefined).
+   */
+  allowedTools?: string[] | 'all';
 }
 
 export interface QueryInput {
