@@ -10,7 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { getInboundSourceSessionId, migrateMessagesInTable } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  hasFutureScheduledWork,
+  migrateMessagesInTable,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -89,6 +94,65 @@ describe('migrateMessagesInTable', () => {
 
     expect(getInboundSourceSessionId(db, 'legacy-2')).toBeNull();
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
+    db.close();
+  });
+});
+
+describe('hasFutureScheduledWork', () => {
+  function freshDb(): Database.Database {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    return new Database(DB_PATH);
+  }
+
+  it('is false for an empty session', () => {
+    const db = freshDb();
+    expect(hasFutureScheduledWork(db)).toBe(false);
+    db.close();
+  });
+
+  it('is false when the only pending row is already due', () => {
+    const db = freshDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
+       VALUES ('m-due', 2, 'chat', datetime('now'), 'pending', datetime('now', '-1 minute'), '{}')`,
+    ).run();
+    expect(hasFutureScheduledWork(db)).toBe(false);
+    db.close();
+  });
+
+  it('is true for a recurring task waiting on its next occurrence', () => {
+    // Mirrors what recurrence.ts's insertRecurrence writes: pending, future
+    // process_after, recurrence carried forward. This is the exact shape
+    // that let a live reply-poll task's session get TTL-swept — the task
+    // kept firing every 5 minutes but never touched last_active.
+    const db = freshDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, content)
+       VALUES ('m-recur', 2, 'task', datetime('now'), 'pending', datetime('now', '+5 minutes'), '*/5 * * * *', '{}')`,
+    ).run();
+    expect(hasFutureScheduledWork(db)).toBe(true);
+    db.close();
+  });
+
+  it('is true for a one-shot reminder not yet due', () => {
+    const db = freshDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
+       VALUES ('m-oneshot', 2, 'task', datetime('now'), 'pending', datetime('now', '+3 days'), '{}')`,
+    ).run();
+    expect(hasFutureScheduledWork(db)).toBe(true);
+    db.close();
+  });
+
+  it('ignores completed/failed rows even with a future process_after', () => {
+    const db = freshDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
+       VALUES ('m-done', 2, 'task', datetime('now'), 'completed', datetime('now', '+5 minutes'), '{}')`,
+    ).run();
+    expect(hasFutureScheduledWork(db)).toBe(false);
     db.close();
   });
 });
