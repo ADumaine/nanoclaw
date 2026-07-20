@@ -12,6 +12,7 @@ import './agents.js';
 import './self-mod.js';
 import './mondai.js';
 import './opportunities.js';
+import './onboarding.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {

@@ -520,6 +520,26 @@ async function buildContainerArgs(
     args.push('-e', `${key}=${rewriteLocalhostUrl(effective)}`);
   }
 
+  // Forward SKILLSCRIPT_RPC_URL so onboarding.ts can dispatch deterministic
+  // render/advance steps through skillscript-runtime's execute_skill when set.
+  const skillscriptRpcUrl = process.env.SKILLSCRIPT_RPC_URL;
+  if (skillscriptRpcUrl) {
+    args.push('-e', `SKILLSCRIPT_RPC_URL=${rewriteLocalhostUrl(skillscriptRpcUrl)}`);
+  }
+
+  // Forward WEBAPP_SHARED_SECRET so onboarding.ts can call GET
+  // /agent/onboarding/settings (auth'd via x-shared-secret, not the
+  // CM_AGENT_TOKEN bearer scheme every other onboarding_* endpoint uses).
+  // Normally host-only (src/channels/webapp.ts) for the opposite direction
+  // (API server -> NanoClaw callback) — this is the one container-side
+  // exception, deliberately read as its own var rather than reusing
+  // CM_AGENT_TOKEN, since the two happen to share a value today but are not
+  // guaranteed to stay in sync.
+  const webappSharedSecretEnv = readEnvFile(['WEBAPP_SHARED_SECRET'])['WEBAPP_SHARED_SECRET'];
+  if (webappSharedSecretEnv) {
+    args.push('-e', `WEBAPP_SHARED_SECRET=${webappSharedSecretEnv}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -542,6 +562,14 @@ async function buildContainerArgs(
   if (cmApiUrl) {
     try {
       noProxyHosts.push(new URL(cmApiUrl).hostname);
+    } catch {
+      /* ignore malformed URL */
+    }
+  }
+  if (skillscriptRpcUrl) {
+    try {
+      const h = new URL(skillscriptRpcUrl).hostname;
+      if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
     } catch {
       /* ignore malformed URL */
     }
