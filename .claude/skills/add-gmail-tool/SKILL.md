@@ -25,6 +25,12 @@ If not connected, tell the user:
 
 > Open the OneCLI web UI at http://127.0.0.1:10254, go to Apps → Gmail, and click Connect. Sign in with the Google account you want the agent to act as.
 
+### Pick where the stub lives
+
+The examples below use `~/.gmail-mcp` — fine for a single-operator personal install. For a **shared/multi-user instance** (the account being connected belongs to the deployment, not to whoever happens to be logged into the host), prefer an instance-scoped path instead: `$DATA_DIR/gmail-mcp` (i.e. `<project-root>/data/gmail-mcp`, already gitignored — see `src/config.ts`'s `DATA_DIR`) rather than the operator's home directory. Ask the user which fits their deployment before proceeding, and substitute that path for `~/.gmail-mcp` throughout this phase.
+
+**Landmine:** the mount-allowlist blocklist rejects any mount path that *contains* the substring `credentials` anywhere in it (see `DEFAULT_BLOCKED_PATTERNS` in `src/modules/mount-security/index.ts`) — don't nest the stub under a folder literally named `credentials/`. `gmail-mcp` as the leaf directory name (holding `credentials.json` as a *file*, which is fine — the check is against the mount's own root path, not its contents) works either under `~/` or under `$DATA_DIR/`.
+
 ### Verify stub credentials exist
 
 ```bash
@@ -72,7 +78,7 @@ chmod 600 ~/.gmail-mcp/gcp-oauth.keys.json ~/.gmail-mcp/credentials.json
 cat ~/.config/nanoclaw/mount-allowlist.json
 ```
 
-`~/.gmail-mcp` must sit under an `allowedRoots` entry (e.g. `/home/<user>`). If it doesn't, tell the user to run `/manage-mounts` first or add their home directory.
+Whichever path you picked above must sit under an `allowedRoots` entry — either broadly (e.g. `/home/<user>`) or narrowly (an entry pointing at the stub directory itself, e.g. `<project-root>/data/gmail-mcp`, which is the tighter-scoped option and preferable for shared instances). If it doesn't, tell the user to run `/manage-mounts` first, or add the entry directly (`allowReadWrite: true` — Phase 3's mount is read-write).
 
 ### Check agent secret-mode
 
@@ -97,13 +103,13 @@ onecli agents secrets --id <agent-id>
 ### Check if already applied
 
 ```bash
-grep -q 'GMAIL_MCP_VERSION' container/Dockerfile && \
+grep -q 'server-gmail-autoauth-mcp' container/cli-tools.json && \
 echo "ALREADY APPLIED — skip to Phase 3"
 ```
 
 ### Copy the skill's tests into the container tree
 
-Both integration points this skill relies on live in the container (Bun) tree — the Dockerfile package install and the dynamic allow-pattern derivation in `claude.ts` — so the guards go there. `cp` overwrites, so re-running is safe.
+Both integration points this skill relies on live in the container (Bun) tree — the manifest-driven package install and the dynamic allow-pattern derivation in `claude.ts` — so the guards go there. `cp` overwrites, so re-running is safe.
 
 ```bash
 S=.claude/skills/add-gmail-tool
@@ -111,38 +117,23 @@ cp $S/gmail-dockerfile.test.ts    container/agent-runner/src/providers/gmail-doc
 cp $S/gmail-allow-pattern.test.ts container/agent-runner/src/providers/gmail-allow-pattern.test.ts
 ```
 
-- `gmail-dockerfile.test.ts` asserts the `GMAIL_MCP_VERSION` ARG and the pinned `pnpm install -g` line are present — the `gmail-mcp` binary is a Dockerfile-installed CLI, not importable or typed, so this structural guard is what goes red if the install is dropped.
+- `gmail-dockerfile.test.ts` asserts `container/cli-tools.json` still carries the `@gongrzhe/server-gmail-autoauth-mcp` entry and its `zod-to-json-schema` pin — the `gmail-mcp` binary isn't importable or typed, so this structural guard is what goes red if the manifest entry is dropped.
 - `gmail-allow-pattern.test.ts` asserts `claude.ts` still spreads `Object.keys(this.mcpServers).map(mcpAllowPattern)` into `allowedTools` — the derivation that makes registering `gmail` (Phase 3) enough to expose `mcp__gmail__*`.
 
-### Add MCP server to Dockerfile
+### Add gmail-mcp to the CLI tools manifest
 
-Edit `container/Dockerfile`. Find the pinned-version ARG block:
+Global Node CLIs are no longer added by editing `container/Dockerfile` directly — they're declared in `container/cli-tools.json`, a skill-appendable manifest installed by `install-cli-tools.sh` (`pnpm install -g` over every entry, pinned). Append two entries:
 
-```dockerfile
-ARG CLAUDE_CODE_VERSION=2.1.154
-ARG AGENT_BROWSER_VERSION=latest
-ARG VERCEL_VERSION=52.2.1
-ARG BUN_VERSION=1.3.12
+```json
+{ "name": "@gongrzhe/server-gmail-autoauth-mcp", "version": "1.1.11" },
+{ "name": "zod-to-json-schema", "version": "3.22.5" }
 ```
 
-Add a new line:
+Both entries are installed in the same `pnpm install -g` invocation (the manifest installs everything at once), which is what the `zod-to-json-schema` pin depends on — see below.
 
-```dockerfile
-ARG GMAIL_MCP_VERSION=1.1.11
-```
+Pinned version matters — `minimumReleaseAge` in `pnpm-workspace.yaml` gates trunk installs, and CLAUDE.md requires a fixed version for all Node CLIs installed into the image. Neither entry needs `"onlyBuilt": true` — gmail-mcp has no native postinstall step.
 
-Then find the last pnpm global-install `RUN` block (the one that installs `@anthropic-ai/claude-code`) and add a new block directly after it (before the `# ---- ncl CLI wrapper` section):
-
-```dockerfile
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g \
-        "@gongrzhe/server-gmail-autoauth-mcp@${GMAIL_MCP_VERSION}" \
-        "zod-to-json-schema@3.22.5"
-```
-
-Pinned version matters — `minimumReleaseAge` in `pnpm-workspace.yaml` gates trunk installs, and CLAUDE.md requires a fixed ARG version for all Node CLIs installed into the image.
-
-**Why the `zod-to-json-schema` pin:** `@gongrzhe/server-gmail-autoauth-mcp@1.1.11` has loose deps (`zod-to-json-schema: ^3.22.1`, `zod: ^3.22.4`). pnpm resolves `zod-to-json-schema` to the latest 3.25.x, which imports `zod/v3` — a subpath that only exists in `zod>=3.25`. But `zod` resolves to `3.24.x` (highest satisfying `^3.22.4` without breaking peer ranges). Result: `ERR_PACKAGE_PATH_NOT_EXPORTED` at import time. Pinning `zod-to-json-schema` to a pre-v3-subpath version avoids it. Re-check if you bump `GMAIL_MCP_VERSION`.
+**Why the `zod-to-json-schema` pin:** `@gongrzhe/server-gmail-autoauth-mcp@1.1.11` has loose deps (`zod-to-json-schema: ^3.22.1`, `zod: ^3.22.4`). pnpm resolves `zod-to-json-schema` to the latest 3.25.x, which imports `zod/v3` — a subpath that only exists in `zod>=3.25`. But `zod` resolves to `3.24.x` (highest satisfying `^3.22.4` without breaking peer ranges). Result: `ERR_PACKAGE_PATH_NOT_EXPORTED` at import time. Pinning `zod-to-json-schema` to a pre-v3-subpath version avoids it. Re-check if you bump the `@gongrzhe/server-gmail-autoauth-mcp` version in `cli-tools.json`.
 
 The Gmail allow-pattern is derived automatically. `container/agent-runner/src/providers/claude.ts` builds `allowedTools` from each group's `mcpServers` map (`Object.keys(this.mcpServers).map(mcpAllowPattern)`), so registering `gmail` in Phase 3 exposes `mcp__gmail__*` to the agent.
 
@@ -174,19 +165,22 @@ ncl groups config add-mcp-server \
   --name gmail \
   --command gmail-mcp \
   --args '[]' \
-  --env '{"GMAIL_OAUTH_PATH":"/workspace/extra/.gmail-mcp/gcp-oauth.keys.json","GMAIL_CREDENTIALS_PATH":"/workspace/extra/.gmail-mcp/credentials.json"}'
+  --env '{"GMAIL_OAUTH_PATH":"/workspace/extra/<container-path>/gcp-oauth.keys.json","GMAIL_CREDENTIALS_PATH":"/workspace/extra/<container-path>/credentials.json"}'
 ```
+
+`<container-path>` must match the `containerPath` used in the mount below (e.g. `.gmail-mcp` for a home-dir stub, or `gmail-mcp` for an instance-scoped `$DATA_DIR` stub — see the naming landmine noted in Phase 1: it just can't contain the substring `credentials`).
 
 Approval behaviour depends on where you run it: from inside an agent's container `ncl` write verbs are approval-gated (admin approves before it lands); from a host operator shell with full scope, it executes immediately. Either way, the response tells you which path it took.
 
-### Add the `.gmail-mcp` mount
+### Add the mount
 
 There is no `ncl groups config add-mount` verb yet (tracked in [#2395](https://github.com/nanocoai/nanoclaw/issues/2395)). Until that ships, edit the DB directly via the in-tree wrapper (`scripts/q.ts` — `setup/verify.ts:5` codifies that NanoClaw avoids depending on the `sqlite3` CLI binary, so don't shell out to it):
 
 ```bash
 GROUP_ID='<group-id>'
-HOST_PATH="$HOME/.gmail-mcp"
-MOUNT=$(jq -cn --arg h "$HOST_PATH" '{hostPath:$h, containerPath:".gmail-mcp", readonly:false}')
+HOST_PATH="$HOME/.gmail-mcp"   # or "$(pwd)/data/gmail-mcp" for an instance-scoped stub
+CONTAINER_PATH=".gmail-mcp"    # match whatever you used in GMAIL_OAUTH_PATH/GMAIL_CREDENTIALS_PATH above
+MOUNT=$(jq -cn --arg h "$HOST_PATH" --arg c "$CONTAINER_PATH" '{hostPath:$h, containerPath:$c, readonly:false}')
 pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs \
   SET additional_mounts = json_insert(additional_mounts, '\$[#]', json('$MOUNT')), \
       updated_at = datetime('now') \
@@ -197,7 +191,7 @@ Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` place
 
 **Switch to `ncl groups config add-mount` once #2395 lands.** Update this skill at that time.
 
-**Why the container path is relative:** `mount-security` rejects absolute `containerPath` values. Additional mounts are prefixed with `/workspace/extra/`, so `containerPath: ".gmail-mcp"` lands at `/workspace/extra/.gmail-mcp`. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location inside the container.
+**Why the container path is relative:** `mount-security` rejects absolute `containerPath` values. Additional mounts are prefixed with `/workspace/extra/`, so e.g. `containerPath: "gmail-mcp"` lands at `/workspace/extra/gmail-mcp`. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location inside the container.
 
 **Why this can't be `groups/<folder>/container.json`:** post-migration `014-container-configs`, `materializeContainerJson` in `src/container-config.ts` rewrites that file from the DB on every spawn. Anything hand-edited there is silently overwritten on next restart.
 
