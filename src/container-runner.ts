@@ -561,21 +561,6 @@ async function buildContainerArgs(
   args.push('-e', `NO_PROXY=${noProxy}`);
   args.push('-e', `no_proxy=${noProxy}`);
 
-  // Forward Anthropic endpoint overrides so our values win over any OneCLI sentinel.
-  // Fall back to .env for keys not exported into the host process environment.
-  // When routing through the LLM proxy and session context is available, encode
-  // llm_mode and user_id into the key so the proxy can resolve user credentials:
-  // ANTHROPIC_API_KEY="<base_key>:<llm_mode>:<user_id>"
-  const anthropicEnv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
-  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL'] as const) {
-    let value = process.env[key] ?? anthropicEnv[key];
-    if (value === undefined) continue;
-    if (key === 'ANTHROPIC_API_KEY' && sessionContext?.llmMode && sessionContext?.userId) {
-      value = `${value}:${sessionContext.llmMode}:${sessionContext.userId}`;
-    }
-    args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
-  }
-
   // User mapping
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
@@ -610,6 +595,23 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // Forward Anthropic endpoint overrides so our values win over any OneCLI sentinel.
+  // Must come AFTER applyContainerConfig — Docker uses the last -e value for
+  // duplicate keys, so these must be pushed last to override what OneCLI injected.
+  // Fall back to .env for keys not exported into the host process environment.
+  // When routing through the LLM proxy and session context is available, encode
+  // llm_mode and user_id into the key so the proxy can resolve user credentials:
+  // ANTHROPIC_API_KEY="<base_key>:<llm_mode>:<user_id>"
+  const anthropicEnv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
+  for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL'] as const) {
+    let value = process.env[key] ?? anthropicEnv[key];
+    if (value === undefined) continue;
+    if (key === 'ANTHROPIC_API_KEY' && sessionContext?.llmMode && sessionContext?.userId) {
+      value = `${value}:${sessionContext.llmMode}:${sessionContext.userId}`;
+    }
+    args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
+  }
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
