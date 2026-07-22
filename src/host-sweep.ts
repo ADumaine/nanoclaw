@@ -38,6 +38,7 @@ import {
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
+  hasFutureScheduledWork,
   markMessageFailed,
   retryWithBackoff,
   syncProcessingAcks,
@@ -375,6 +376,24 @@ function sweepStaleSessions(sessions: Session[]): void {
   for (const session of sessions) {
     const lastActive = session.last_active ?? session.created_at;
     if (!lastActive || lastActive > cutoff) continue;
+
+    // A recurring task can fire silently for days (wakeAgent:false every
+    // time) without ever touching last_active — don't destroy a session
+    // that still has scheduled work ahead of it just because nobody's
+    // chatted with it directly. See hasFutureScheduledWork doc comment.
+    try {
+      const inDb = openInboundDb(session.agent_group_id, session.id);
+      try {
+        if (hasFutureScheduledWork(inDb)) {
+          log.debug('TTL sweep: keeping session with pending scheduled work', { sessionId: session.id });
+          continue;
+        }
+      } finally {
+        inDb.close();
+      }
+    } catch {
+      // inbound.db missing/unreadable — fall through to normal TTL cleanup.
+    }
 
     log.info('TTL sweep: removing stale session', {
       sessionId: session.id,

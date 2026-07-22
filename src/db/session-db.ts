@@ -146,6 +146,27 @@ export function countDueMessages(db: Database.Database): number {
   ).count;
 }
 
+/**
+ * True if this session has a pending message scheduled for the future —
+ * either a recurring task's next occurrence or a one-shot reminder. TTL
+ * sweep must not delete a session with scheduled work still ahead of it:
+ * a recurring task can fire silently (wakeAgent:false) for days without
+ * ever producing real chat activity, so last_active alone is not a safe
+ * "is this session still in use" signal.
+ */
+export function hasFutureScheduledWork(db: Database.Database): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages_in
+        WHERE status = 'pending'
+          AND process_after IS NOT NULL
+          AND datetime(process_after) > datetime('now')
+        LIMIT 1`,
+    )
+    .get();
+  return !!row;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }
