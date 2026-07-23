@@ -63,6 +63,30 @@ export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
   return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }
 
+/**
+ * Best-effort "which app_id does this raw handle actually belong to" lookup,
+ * for channel adapters with no native DM-opening API (e.g. the generic
+ * webapp bridge, where many app_ids/bots share one HTTP adapter and a bare
+ * handle like a Telegram numeric ID is meaningless without knowing which of
+ * them it came through). Not a structural guarantee — NanoClaw doesn't track
+ * a canonical handle→app_id mapping — just the most recently active session
+ * whose thread_id happens to contain the handle, which matches the thread_id
+ * naming convention observed in practice (e.g. "telegram_<handle>").
+ */
+export function findRecentPlatformIdForHandle(channelType: string, handle: string): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT mg.platform_id AS platform_id
+         FROM sessions s
+         JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+        WHERE mg.channel_type = ? AND s.thread_id LIKE '%' || ? || '%'
+     ORDER BY s.last_active DESC
+        LIMIT 1`,
+    )
+    .get(channelType, handle) as { platform_id: string } | undefined;
+  return row?.platform_id;
+}
+
 export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }

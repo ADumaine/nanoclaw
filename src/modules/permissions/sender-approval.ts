@@ -43,6 +43,21 @@ function generateId(): string {
   return `nsa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Escape Telegram legacy-Markdown special characters in dynamic/untrusted
+ * text before interpolating it into a message declared `format: 'markdown'`
+ * (webapp.ts always sets this). Without it, a sender display name containing
+ * one of these — e.g. a real user "Robin_Philip" — breaks the receiving
+ * platform's Markdown parser: an unpaired `_` opens an italic span with no
+ * closing `_`, and Telegram rejects the whole message with a 400 ("can't
+ * parse entities"). Confirmed live 2026-07-23. Scoped to legacy Markdown's
+ * four special characters, not MarkdownV2's full set — broader escaping
+ * would itself corrupt rendering under legacy mode.
+ */
+function escapeMarkdown(text: string): string {
+  return text.replace(/([_*`[])/g, '\\$1');
+}
+
 export interface RequestSenderApprovalInput {
   messagingGroupId: string;
   agentGroupId: string;
@@ -62,6 +77,28 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       senderIdentity,
     });
     return;
+  }
+
+  // Best-effort notice back to the requester, gated the same as the approval
+  // card (once per pending request, not once per retry). Without this, a
+  // first-time sender gets total silence — POST /message always returns 202
+  // immediately regardless of what happens next, and nothing else in this
+  // flow replies to the original thread. Silence reads as "broken" on a
+  // webapp chat interface in particular, where near-instant replies are the
+  // norm. Fire-and-forget on purpose — sent before approver resolution, so
+  // it goes out even in the (already-broken) edge case where no approver is
+  // configured; that's a minor secondary problem, not worth blocking on.
+  const notifyAdapter = getDeliveryAdapter();
+  if (notifyAdapter) {
+    void notifyAdapter
+      .deliver(
+        event.channelType,
+        event.platformId,
+        event.threadId,
+        'chat',
+        JSON.stringify({ text: "Thanks — I've sent your access request to an admin for approval." }),
+      )
+      .catch((err) => log.error('Pending-approval notice failed to send', { err }));
   }
 
   const approvers = pickApprover(agentGroupId);
@@ -87,11 +124,17 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   }
 
   const approvalId = generateId();
-  const senderDisplay = senderName && senderName.length > 0 ? senderName : senderIdentity;
-  const originName = originMg?.name ?? `a ${originChannelType} channel`;
+  const senderDisplay = escapeMarkdown(senderName && senderName.length > 0 ? senderName : senderIdentity);
+  const originName = escapeMarkdown(originMg?.name ?? `a ${originChannelType} channel`);
 
   const title = '👤 New sender';
-  const question = `${senderDisplay} wants to talk to your agent in ${originName}. Allow?`;
+  // Delivery can land in a shared/group channel (e.g. resolved via the most
+  // recently active session for the approver's identity, which may not be a
+  // private DM) — say explicitly that only an existing admin's click counts,
+  // since the authorization check (any admin of this agent group, not just
+  // the originally-targeted approver) already enforces this silently and a
+  // reader with no context otherwise has no way to know who's allowed to act.
+  const question = `${senderDisplay} wants to talk to your agent in ${originName}. Only an existing admin of this agent can approve. Allow?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
   createPendingSenderApproval({

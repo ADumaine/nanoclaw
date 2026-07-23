@@ -45,7 +45,7 @@ import fs from 'fs';
 import http from 'http';
 
 import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { findSession, deleteSession } from '../db/sessions.js';
+import { findRecentPlatformIdForHandle, findSession, deleteSession } from '../db/sessions.js';
 import { readEnvFile, readEnvPrefix } from '../env.js';
 import { log } from '../log.js';
 import { killContainer } from '../container-runner.js';
@@ -349,6 +349,24 @@ registerChannelAdapter(CHANNEL_TYPE, {
         } catch {
           // typing indicators are best-effort
         }
+      },
+
+      // The generic webapp bridge has no native "open a DM" platform API
+      // (unlike Discord's POST /users/@me/channels) — many app_ids/bots
+      // share this one HTTP adapter, so a bare handle (e.g. a raw Telegram
+      // numeric ID) is meaningless without knowing which app_id it actually
+      // belongs to. Without this, ensureUserDm's no-openDM fallback treats
+      // the handle as directly addressable and returns it bare, producing
+      // an unroutable platform_id downstream (confirmed live: a proactive
+      // approval-card delivery sent app_id="5945384141" instead of
+      // "webapp:telegram_onboarding_bot", and the receiving API server had
+      // to guess a fallback thread — and guessed wrong).
+      async openDM(handle: string): Promise<string> {
+        const platformId = findRecentPlatformIdForHandle(CHANNEL_TYPE, handle);
+        if (!platformId) {
+          throw new Error(`webapp openDM: no prior session found for handle "${handle}"`);
+        }
+        return platformId;
       },
     };
 

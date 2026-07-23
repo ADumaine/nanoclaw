@@ -23,6 +23,7 @@ import {
   createSession,
   getSession,
   findSession,
+  findRecentPlatformIdForHandle,
   getSessionsByAgentGroup,
   getActiveSessions,
   getRunningSessions,
@@ -366,6 +367,99 @@ describe('sessions', () => {
     createSession(sess());
     deleteSession('sess-1');
     expect(getSession('sess-1')).toBeUndefined();
+  });
+});
+
+describe('findRecentPlatformIdForHandle', () => {
+  beforeEach(() => {
+    createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+    createMessagingGroup({
+      id: 'mg-webapp-1',
+      channel_type: 'webapp',
+      platform_id: 'webapp:some-bot',
+      name: 'Some Bot',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-webapp-2',
+      channel_type: 'webapp',
+      platform_id: 'webapp:other-bot',
+      name: 'Other Bot',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-discord-1',
+      channel_type: 'discord',
+      platform_id: 'chan-1',
+      name: 'Discord',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+  });
+
+  it('returns undefined when no session matches the handle', () => {
+    expect(findRecentPlatformIdForHandle('webapp', '5945384141')).toBeUndefined();
+  });
+
+  it('finds the platform_id via a thread_id containing the handle', () => {
+    createSession({
+      id: 'sess-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-webapp-1',
+      thread_id: 'telegram_5945384141',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    expect(findRecentPlatformIdForHandle('webapp', '5945384141')).toBe('webapp:some-bot');
+  });
+
+  it('ignores a matching thread_id on a different channel_type', () => {
+    createSession({
+      id: 'sess-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-discord-1',
+      thread_id: 'telegram_5945384141',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    expect(findRecentPlatformIdForHandle('webapp', '5945384141')).toBeUndefined();
+  });
+
+  it('picks the most recently active session when the handle matches more than one', () => {
+    createSession({
+      id: 'sess-old',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-webapp-1',
+      thread_id: 'telegram_5945384141',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: '2026-01-01T00:00:00.000Z',
+      created_at: now(),
+    });
+    createSession({
+      id: 'sess-new',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-webapp-2',
+      thread_id: 'telegram_5945384141',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: '2026-06-01T00:00:00.000Z',
+      created_at: now(),
+    });
+    expect(findRecentPlatformIdForHandle('webapp', '5945384141')).toBe('webapp:other-bot');
   });
 });
 

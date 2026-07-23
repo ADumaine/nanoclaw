@@ -160,8 +160,18 @@ describe('unknown-sender request_approval flow', () => {
     // Wait for the fire-and-forget requestSenderApproval to resolve.
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(deliverMock).toHaveBeenCalledTimes(1);
-    const [channel, platformId, thread, kind, content] = deliverMock.mock.calls[0];
+    // Two deliveries: a best-effort "pending approval" notice back to the
+    // requester's own thread, and the approval card to the resolved approver.
+    expect(deliverMock).toHaveBeenCalledTimes(2);
+
+    const noticeCall = deliverMock.mock.calls.find((c) => c[1] === 'chat-123');
+    expect(noticeCall).toBeDefined();
+    expect(noticeCall![3]).toBe('chat');
+    expect(JSON.parse(noticeCall![4] as string).text).toMatch(/sent your access request/);
+
+    const cardCall = deliverMock.mock.calls.find((c) => c[1] === 'dm-owner');
+    expect(cardCall).toBeDefined();
+    const [channel, platformId, thread, kind, content] = cardCall!;
     expect(channel).toBe('telegram');
     expect(platformId).toBe('dm-owner'); // delivered to owner's DM
     expect(thread).toBeNull();
@@ -175,6 +185,37 @@ describe('unknown-sender request_approval flow', () => {
     expect(rows).toHaveLength(1);
   });
 
+  it('escapes Telegram Markdown special characters in the sender display name', async () => {
+    // Confirmed live 2026-07-23: an unescaped "_" in a real sender's display
+    // name (e.g. "Robin_Philip") broke Telegram's Markdown parser — the
+    // platform rejected the whole card with a 400 ("can't parse entities"),
+    // since format:'markdown' is always set on outbound webapp delivery.
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound({
+      channelType: 'telegram',
+      platformId: 'chat-123',
+      threadId: null,
+      message: {
+        id: 'stranger-md',
+        kind: 'chat',
+        content: JSON.stringify({
+          senderId: 'tg:stranger',
+          sender: 'Robin_Philip',
+          text: 'hi',
+        }),
+        timestamp: now(),
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    const cardCall = deliverMock.mock.calls.find((c) => c[1] === 'dm-owner');
+    expect(cardCall).toBeDefined();
+    const payload = JSON.parse(cardCall![4] as string);
+    expect(payload.question).toContain('Robin\\_Philip');
+    expect(payload.question).not.toContain('Robin_Philip wants');
+  });
+
   it('dedups a second message from the same stranger while pending', async () => {
     const { routeInbound } = await import('../../router.js');
     await routeInbound(stranger('hello'));
@@ -182,7 +223,9 @@ describe('unknown-sender request_approval flow', () => {
     await routeInbound(stranger('are you there?'));
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(deliverMock).toHaveBeenCalledTimes(1);
+    // Only the first message's notice + card — the dedup check short-circuits
+    // before the second message reaches the notice-send at all.
+    expect(deliverMock).toHaveBeenCalledTimes(2);
     const { getDb } = await import('../../db/connection.js');
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
     expect(count).toBe(1);

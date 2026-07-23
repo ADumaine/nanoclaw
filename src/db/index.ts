@@ -28,6 +28,7 @@ export {
   getSession,
   findSession,
   findSessionByAgentGroup,
+  findRecentPlatformIdForHandle,
   getSessionsByAgentGroup,
   getActiveSessions,
   getRunningSessions,
