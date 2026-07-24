@@ -31,10 +31,18 @@ registerResource({
   customOperations: {
     add: {
       access: 'approval',
-      description: 'Add a user as a member of an agent group. Use --user and --group.',
+      description:
+        'Add a user as a member of an agent group. Use --user and --group (--user-id / --agent-group-id also accepted).',
       handler: async (args) => {
-        const userId = args.user as string;
-        const groupId = args.group as string;
+        // Accept both flag names: the generic help renderer's "Fields:" section
+        // lists the DB column names (user_id, agent_group_id) regardless of
+        // which verb it's under, so a reader skimming past this operation's own
+        // description (which correctly says --user/--group) can reasonably try
+        // --user-id/--agent-group-id instead and hit a confusing "--user is
+        // required" error. Rather than fix only the docs, accept both — no
+        // wrong flag name should ever fail silently or misleadingly here.
+        const userId = (args.user ?? args.user_id) as string;
+        const groupId = (args.group ?? args.agent_group_id) as string;
         const addedBy = (args.added_by as string) ?? null;
         if (!userId) throw new Error('--user is required');
         if (!groupId) throw new Error('--group is required');
@@ -49,10 +57,11 @@ registerResource({
     },
     remove: {
       access: 'approval',
-      description: 'Remove a user from an agent group. Use --user and --group.',
+      description:
+        'Remove a user from an agent group. Use --user and --group (--user-id / --agent-group-id also accepted).',
       handler: async (args) => {
-        const userId = args.user as string;
-        const groupId = args.group as string;
+        const userId = (args.user ?? args.user_id) as string;
+        const groupId = (args.group ?? args.agent_group_id) as string;
         if (!userId) throw new Error('--user is required');
         if (!groupId) throw new Error('--group is required');
         const result = getDb()
