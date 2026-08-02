@@ -65,9 +65,77 @@ Skip the upstream template's example skills (`hello-world.*`, `skill-store-round
 
 Set `SKILLSCRIPT_RPC_URL` in NanoClaw's `.env`, e.g. `http://<host>:7878/rpc`.
 
-## Gmail credentials — separate from all of the above
+## Gmail credentials for the *agent container* — separate from skillscript's own connector below
 
-Gmail auth for the onboarding agent goes through OneCLI's own vault (`mondai@cryptomondays.io`), entirely independent of skillscript. See `.claude/skills/add-gmail-tool/SKILL.md` for the full procedure (stub credential files, mount allowlist, secret-mode check). One thing not in that skill: if connecting Gmail via OneCLI's web UI fails, OneCLI itself may need an explicit `APP_URL` set in **its own** `.env` (separate from NanoClaw's), with its `docker-compose.yml` changed to use `APP_URL: ${APP_URL}` instead of deriving the URL from `ONECLI_BIND_HOST` — OAuth redirect URIs need an exact, externally-reachable URL, and a bind-host-derived value (often `0.0.0.0`, not reachable by a browser or Google's redirect) breaks the flow.
+Gmail auth for the onboarding agent (the container-side `mcp__gmail__*` tools) goes through OneCLI's own vault (`mondai@cryptomondays.io`), independent of skillscript. See `.claude/skills/add-gmail-tool/SKILL.md` for the full procedure (stub credential files, mount allowlist, secret-mode check). One thing not in that skill: if connecting Gmail via OneCLI's web UI fails, OneCLI itself may need an explicit `APP_URL` set in **its own** `.env` (separate from NanoClaw's), with its `docker-compose.yml` changed to use `APP_URL: ${APP_URL}` instead of deriving the URL from `ONECLI_BIND_HOST` — OAuth redirect URIs need an exact, externally-reachable URL, and a bind-host-derived value (often `0.0.0.0`, not reachable by a browser or Google's redirect) breaks the flow.
+
+This section used to say Gmail access was "entirely independent of skillscript." As of 2026-07-28 that's no longer true — skillscript now has its *own* path to Gmail, for a different purpose (deterministic multi-step flows that don't need the agent's own turn to run at all). See the next section.
+
+## Gmail via skillscript's own connector — deterministic sends, no agent turn required
+
+**Why this exists**: flow #4 (save Luma link → go-live email → notify calendar manager → advance to `nagging`) kept failing when left as an agent-driven sequence — redundant tool calls, a skipped notify step, records stuck mid-flow — even after repeated prose fixes in `onboarding-procedures.md`. The fix was to stop describing the sequence in prose and instead build it as an actual skillscript skill: written once, runs the same way every time, no LLM turn in the mechanical part. That requires skillscript itself to be able to send email, which it couldn't before this.
+
+**Mechanism**: a `gmail` connector in `connectors.json`, class `RemoteMcpConnector`, wired to spawn `onecli run --agent <id> -- gmail-mcp` instead of the bare `gmail-mcp` binary. `onecli run` gives *any* command transparent OneCLI credential injection (not something specific to pre-registered agent containers) — this was the actual unlock, found in OneCLI's own docs, and it avoids the more invasive alternative (attaching skillscript's container to whatever Docker network path reaches OneCLI's gateway directly).
+
+```json
+"gmail": {
+  "class": "RemoteMcpConnector",
+  "config": {
+    "command": "onecli",
+    "args": ["run", "--agent", "<OneCLI agent id — see below>", "--", "gmail-mcp"],
+    "framing": "newline",
+    "env": {
+      "GMAIL_OAUTH_PATH": "/data/gmail-mcp/gcp-oauth.keys.json",
+      "GMAIL_CREDENTIALS_PATH": "/data/gmail-mcp/credentials.json"
+    }
+  }
+}
+```
+
+In a skill: `$ gmail.send_email to=["x@y.com"] subject="..." body="..." mimeType="text/plain" approved="..." -> R`.
+
+### Setup steps (dev already done; production needs all of these fresh)
+
+1. **`docker/Dockerfile`** already has this baked in as of 2026-07-28 — installs `onecli`, `gmail-mcp` (`@gongrzhe/server-gmail-autoauth-mcp@1.1.11`, same pin as the agent container), and `gcompat`. Just rebuild: `docker build -t skillscript:latest -f docker/Dockerfile /mnt/merge/skillscript` (or wherever the upstream checkout lives on that host).
+2. **Register (or reuse) a OneCLI agent for skillscript to run as**, on *that host's own* OneCLI instance. Dev reused the existing "Chapter Onboarding" agent (`onecli agents list` to find its `identifier`) rather than provisioning a new one — reasonable for dev, but confirm whether production wants a dedicated agent identity instead. Put the chosen identifier into `connectors.json`'s `args` (the `--agent <id>` value).
+3. **Get an account-level OneCLI API key** (`oc_...` format — distinct from an individual agent's own `aoc_...` access token) for *that host's* OneCLI account. `onecli auth api-key` on a host already authenticated shows it; otherwise generate one via the OneCLI dashboard. Put it in a compose-level `.env` (same directory as `docker-compose.yml`, **not** `data/.env` — that file is skillscript's own in-process dotenv load for `SKILLSCRIPT_SECRET_*` skill secrets, invisible to the shell entrypoint that runs before the node process starts) as `ONECLI_API_KEY=oc_...`. See `.env.example`. Never paste the raw value into a chat session — provision it directly on the host.
+4. **Stub Gmail credential files** at `/data/gmail-mcp/gcp-oauth.keys.json` + `credentials.json` inside the container (content is literally the string `"onecli-managed"`, not real secrets — `gmail-mcp` just needs the files to exist for its own startup check; real auth happens transparently via the `onecli run` wrapper). The `data/` directory is root-owned (container-side writes) — create these via `docker exec`, not directly from the host user.
+5. **`onecli auth login` needs to happen inside the container before any gmail-connector call** — `docker/entrypoint.sh` (inlined into the Dockerfile, since the build context is the upstream checkout and can't `COPY` a file from this deployment folder) does this automatically at container start, reading `ONECLI_API_KEY` from step 3.
+6. **Set `~/.onecli/config.json`'s `api-host`** to that host's own OneCLI gateway address, *before* `auth login` — also handled by the entrypoint. **Do not assume dev's value (`http://172.17.0.1:10254`) is correct for production** — that's dev's Docker `docker0` bridge gateway IP specifically. Find production's real value the same way it was found for dev: check `~/.onecli/config.json` on a host where `onecli` already works, or `onecli auth status`/the OneCLI dashboard.
+
+### Known gotchas — don't rediscover these on production
+
+- **`gcompat` is required**, not optional. The `onecli` release binary is a dynamically-linked glibc ELF despite looking like a static Go build. Without `gcompat`, Alpine/musl fails to exec it with a misleading `onecli: not found` — the file is right there; it's onecli's own required dynamic linker that's missing, and the kernel's ENOENT on the missing interpreter surfaces through the shell as "command not found." Already in the Dockerfile; just don't remove it.
+- **Set `api-host` via the real `onecli config set api-host <url>` command, never by hand-writing `~/.onecli/config.json`.** This is the actual root cause behind two different-looking failures encountered getting this working, and it's worth being precise about since the symptom (`"invalid API key..."`) points straight at the key, which was never the problem:
+  - First symptom: `onecli auth login` failed with `"invalid API key: the server rejected this key"` on CLI `2.7.0` (latest at the time) against a key independently proven valid on the host (host was running CLI `1.7.0`). Diagnosed as a version-skew problem — onecli 2.x genuinely did change its default API base URL and endpoint prefix (`/v1` instead of `/api`, default host moved to the public `api.onecli.sh`) — and "fixed" by pinning to `1.7.0`.
+  - That pin was real but the wrong fix. Re-tested later with `2.7.0` again, using `onecli config set api-host <url>` (the actual CLI command) instead of a hand-written `config.json` — **worked immediately, first try, no other change.** The hand-written file happened to match what `1.7.0`'s config reader expected but was silently not honored by `2.7.0`'s (different internal format or location — never fully diagnosed, and doesn't need to be, since the command-based fix is version-safe by construction). Current Dockerfile is pinned to `2.7.0` (still deliberately, not the auto-latest install script — see the Dockerfile's own comment) purely because "current latest" is a reasonable default when there's no reason not to, not because a specific version number matters.
+  - **The general lesson, not just the specific fix**: when a tool provides its own command for setting persistent config, use that command, not a hand-authored file matching today's observed format — file formats are the kind of thing that changes silently across versions in ways a command's own interface is built to abstract over.
+  - The gateway's own version (`/api/health`, e.g. `1.41.0` on dev) is a completely separate numbering scheme from the CLI's `onecli --help`-reported version — don't try to match them to each other; they're unrelated products.
+- `connectors.json` and the Gmail stub credential files are root-owned on the host (bind-mounted, written by the container) — edit via `docker exec`/`docker cp`, not directly as the host user.
+
+### Verification (real send, unlike the render-only check above)
+
+```bash
+# 1. Confirm the connector chain works at all (no skill needed yet):
+docker exec <dashboard-container> sh -c 'onecli run --agent <id> -- curl -s https://gmail.googleapis.com/gmail/v1/users/me/labels'
+# Expect real Gmail label JSON, not a 401/403.
+
+# 2. Write a minimal test skill via the skill_write RPC tool (directly callable over
+# /rpc, same as execute_skill — not only usable from inside another skill's body):
+curl -s -X POST http://localhost:7878/rpc -H "Content-Type: application/json" -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"skill_write","arguments":{"name":"test-send-email","overwrite":true,"source":
+    "# Skill: test-send-email\n# Vars: TO, SUBJECT=\"test\", BODY=\"test\"\n# Status: Approved\n\nsend:\n    $ gmail.send_email to=[\"${TO}\"] subject=\"${SUBJECT}\" body=\"${BODY}\" mimeType=\"text/plain\" approved=\"connector validation\" -> R\n    emit(text=\"${R}\")\n\ndefault: send\n"
+  }}
+}'
+
+# 3. Execute it for real:
+curl -s -X POST http://localhost:7878/rpc -H "Content-Type: application/json" -d '{
+  "jsonrpc":"2.0","id":2,"method":"tools/call",
+  "params":{"name":"execute_skill","arguments":{"name":"test-send-email","inputs":{"TO":"<a real inbox you can check>"}}}
+}'
+# Expect a real Gmail message ID in the transcript, and the email to actually arrive.
+```
 
 ## Quick end-to-end verification
 
