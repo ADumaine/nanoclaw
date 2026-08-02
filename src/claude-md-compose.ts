@@ -61,11 +61,25 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     : {};
   const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
 
-  // Skill fragments — every skill that ships an `instructions.md`.
-  // TODO (shared-source refactor): respect `container.json` skill selection.
+  // Skill fragments — every skill that ships an `instructions.md`, filtered
+  // by container.json's skill selection (default "all" = no filtering).
+  // Previously every skill with an instructions.md was included unconditionally
+  // regardless of this config — e.g. skill-whatsapp-formatting.md was loaded
+  // into every group's CLAUDE.md even for Telegram-only agents, since the
+  // filtering was never actually implemented.
+  let skillsAllowed: string[] | 'all' = 'all';
+  if (configRow?.skills) {
+    try {
+      const parsed = JSON.parse(configRow.skills) as string[] | 'all';
+      if (parsed !== 'all' && Array.isArray(parsed)) skillsAllowed = parsed;
+    } catch {
+      /* malformed — fall back to 'all' */
+    }
+  }
   const skillsHostDir = path.join(process.cwd(), 'container', 'skills');
   if (fs.existsSync(skillsHostDir)) {
     for (const skillName of fs.readdirSync(skillsHostDir)) {
+      if (skillsAllowed !== 'all' && !skillsAllowed.includes(skillName)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (fs.existsSync(hostFragment)) {
         desired.set(`skill-${skillName}.md`, {
@@ -79,8 +93,21 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // Built-in module fragments — every MCP tool source file that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
   // use that module's MCP tools (schedule_task, install_packages, etc.).
-  // Skip cli.instructions.md when cli_scope is disabled.
+  // Skip cli.instructions.md when cli_scope is disabled, and skip any
+  // module named in disabled_modules (e.g. "self-mod", "agents") — this
+  // was previously never checked here, so a group with self-mod/agents
+  // disabled still had their full instructions loaded into every turn even
+  // though the underlying capability was unusable.
   const cliDisabled = configRow?.cli_scope === 'disabled';
+  let disabledModules: string[] = [];
+  if (configRow?.disabled_modules) {
+    try {
+      const parsed = JSON.parse(configRow.disabled_modules) as string[];
+      if (Array.isArray(parsed)) disabledModules = parsed;
+    } catch {
+      /* malformed — treat as none disabled */
+    }
+  }
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir)) {
@@ -88,6 +115,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
+      if (disabledModules.includes(moduleName)) continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,
