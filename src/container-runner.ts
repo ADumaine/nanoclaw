@@ -170,13 +170,25 @@ async function spawnContainer(session: Session): Promise<void> {
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
 
-  // Derive appId from messaging group platform_id for CM_* env overrides
+  // Derive appId from messaging group platform_id for CM_* env overrides.
+  // Webapp-channel platform_ids are stored as "webapp:<app_id>" (see
+  // src/channels/webapp.ts, which does this same strip on the way back out
+  // for deliver()/setTyping()) — the CM_*_<app_id> override keys in .env use
+  // the bare app_id, so the prefix must come off here too. Without this,
+  // appId was always the full "webapp:<app_id>" string, which never matched
+  // any CM_*_<app_id> key — every per-app_id override in .env silently
+  // never fired, regardless of agent group. (Re-applied 2026-08-02 — the
+  // 401 that surfaced when this first went live was an invalid
+  // CM_AGENT_TOKEN_cm-onboarding value, since fixed API-side, not a problem
+  // with this derivation itself.)
   let appId: string | undefined;
   if (session.messaging_group_id) {
     try {
       const messagingGroup = getMessagingGroup(session.messaging_group_id);
       if (messagingGroup?.platform_id) {
-        appId = messagingGroup.platform_id;
+        appId = messagingGroup.platform_id.startsWith('webapp:')
+          ? messagingGroup.platform_id.slice('webapp:'.length)
+          : messagingGroup.platform_id;
       }
     } catch {
       // Fall through, appId remains undefined
@@ -522,9 +534,25 @@ async function buildContainerArgs(
 
   // Forward SKILLSCRIPT_RPC_URL so onboarding.ts can dispatch deterministic
   // render/advance steps through skillscript-runtime's execute_skill when set.
-  const skillscriptRpcUrl = process.env.SKILLSCRIPT_RPC_URL;
+  const skillscriptRpcUrl = readEnvFile(['SKILLSCRIPT_RPC_URL'])['SKILLSCRIPT_RPC_URL'];
   if (skillscriptRpcUrl) {
     args.push('-e', `SKILLSCRIPT_RPC_URL=${rewriteLocalhostUrl(skillscriptRpcUrl)}`);
+  }
+
+  // Forward CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS so a state-driven agent group
+  // that re-fetches everything from an API rather than relying on
+  // conversation memory (e.g. cm-onboarding) can rotate out old context
+  // sooner than the 14-day global default. Keyed by agent-group folder
+  // (stable, always present) rather than appId — this override is unrelated
+  // to the CM_AGENT_TOKEN/appId derivation issue above (pure local
+  // transcript-file handling, nothing sent over the wire), so it's safe to
+  // keep even while that appId fix is reverted pending investigation.
+  const transcriptRotateAgeOverrides = readEnvPrefix('CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS_');
+  const transcriptRotateAgeDays =
+    transcriptRotateAgeOverrides[agentGroup.folder] ??
+    readEnvFile(['CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS'])['CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS'];
+  if (transcriptRotateAgeDays) {
+    args.push('-e', `CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS=${transcriptRotateAgeDays}`);
   }
 
   // Forward WEBAPP_SHARED_SECRET so onboarding.ts can call GET
@@ -568,7 +596,9 @@ async function buildContainerArgs(
   }
   if (skillscriptRpcUrl) {
     try {
-      const h = new URL(skillscriptRpcUrl).hostname;
+      // Hostname after rewrite (localhost -> host.docker.internal), since
+      // that's the hostname the container actually connects to.
+      const h = new URL(rewriteLocalhostUrl(skillscriptRpcUrl)).hostname;
       if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
     } catch {
       /* ignore malformed URL */
@@ -639,6 +669,20 @@ async function buildContainerArgs(
       value = `${value}:${sessionContext.llmMode}:${sessionContext.userId}`;
     }
     args.push('-e', `${key}=${rewriteLocalhostUrl(value)}`);
+  }
+
+  // Forward ANTHROPIC_CUSTOM_HEADERS so a per-agent-group identifier (e.g.
+  // "x-app-id: telegram_onboarding_bot" for cm-onboarding) reaches the LLM
+  // proxy on every single turn — unlike system-prompt content scanning,
+  // this doesn't depend on the system prompt being resent (it usually isn't,
+  // past the first turn of a resumed session). Keyed by agent-group folder,
+  // not appId, same rationale as the transcript-rotation-age override above.
+  const anthropicCustomHeadersOverrides = readEnvPrefix('ANTHROPIC_CUSTOM_HEADERS_');
+  const anthropicCustomHeaders =
+    anthropicCustomHeadersOverrides[agentGroup.folder] ??
+    readEnvFile(['ANTHROPIC_CUSTOM_HEADERS'])['ANTHROPIC_CUSTOM_HEADERS'];
+  if (anthropicCustomHeaders) {
+    args.push('-e', `ANTHROPIC_CUSTOM_HEADERS=${anthropicCustomHeaders}`);
   }
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
