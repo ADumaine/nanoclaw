@@ -56,9 +56,21 @@
  *                                      skill when SKILLSCRIPT_RPC_URL is set, unless a
  *                                      `variables` override is supplied)
  *   onboarding_link_luma            — store Luma calendar url/id
+ *   onboarding_go_live              — atomic link-luma + go-live email + calendar-manager notify +
+ *                                      advance-to-nagging (skillscript skill "onboarding-go-live",
+ *                                      only registered when SKILLSCRIPT_RPC_URL is set — no inline
+ *                                      fallback, see the registration comment at its definition)
+ *   onboarding_daily_sweep           — core of flow #6: for every /stalled prospect, sends the
+ *                                      matching follow-up/nag email + advances/touches the stage,
+ *                                      or marks unresponsive + notifies admins once the limit is
+ *                                      hit (skillscript skill "onboarding-daily-sweep", only
+ *                                      registered when SKILLSCRIPT_RPC_URL is set — no inline
+ *                                      fallback, same rationale as onboarding_go_live). Does not
+ *                                      cover the Gmail Needs-Admin scan, daily-summary dispatch,
+ *                                      or relabeling — those stay separate agent-driven tool calls.
  *   onboarding_get_settings         — environment settings incl. calendar manager's Telegram ID
+ *                                      and whether processing is enabled (`active`)
  *   onboarding_notify_telegram      — message a specific Telegram user
- *   onboarding_generate_invite_link — one-time Champions group invite link
  *   onboarding_set_active           — activate chapter + pipeline (transactional); also
  *                                      triggers the Champions welcome announcement internally
  *   onboarding_mark_unresponsive    — mark prospect unresponsive (transactional)
@@ -81,14 +93,6 @@ const API_TOKEN = process.env.CM_AGENT_TOKEN ?? process.env.CM_API_TOKEN;
 // something the agent re-reasons (and can drift on) every call. Falls back to
 // direct apiPost when unset, so this is safe to leave unconfigured elsewhere.
 const SKILLSCRIPT_RPC_URL = process.env.SKILLSCRIPT_RPC_URL;
-
-// Auth for GET /agent/onboarding/settings only — every other onboarding_*
-// endpoint uses the Bearer CM_AGENT_TOKEN scheme (API_TOKEN below). This one
-// endpoint is authenticated with x-shared-secret instead (same secret
-// src/channels/webapp.ts uses for the opposite-direction API->NanoClaw
-// callback). Read as its own var rather than reusing API_TOKEN — the two
-// happen to share a value today but are not guaranteed to stay in sync.
-const WEBAPP_SHARED_SECRET = process.env.WEBAPP_SHARED_SECRET;
 
 // Broadcast to every container (same value everywhere); only matches this
 // container's own agentGroupId when we're actually running as cm-onboarding.
@@ -114,6 +118,128 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
 
   function err(text: string) {
     return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
+  }
+
+  // Pipeline-record formatting for chat display. Moved here deliberately,
+  // rather than left as a prose instruction for the agent to follow — three
+  // separate attempts at prose formatting guidance in onboarding-procedures.md
+  // (raw field dump -> "no changes, want a CSV?" deflection -> partial
+  // compliance -> raw JSON with markdown-escaping artifacts) each produced a
+  // different, still-wrong result, tracking which model happened to handle
+  // that turn rather than the instruction wording. Formatting the text here
+  // means there's nothing left for the model to get wrong — it relays this
+  // verbatim instead of re-summarizing raw JSON itself.
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  function formatUtc(iso: string | null | undefined): string {
+    if (!iso) return 'never';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${hh}:${mm} UTC`;
+  }
+
+  function obRef(id: string): string {
+    return `OB-${String(id).replace(/-/g, '').slice(0, 6)}`;
+  }
+
+  interface PipelineRecordLike {
+    id: string;
+    prospect_name: string;
+    prospect_email?: string;
+    city?: string;
+    country?: string;
+    stage: string;
+    stage_notes?: string | null;
+    last_contact_at?: string | null;
+    chapters?: { name?: string; status?: string } | null;
+  }
+
+  function formatPipelineRecord(r: PipelineRecordLike): string {
+    const chapterName = r.chapters?.name ?? '';
+    const status = r.chapters?.status ?? '';
+    const statusIsNotable = status !== '' && status !== 'onboarding' && !(r.stage === 'active' && status === 'active');
+    const statusSuffix = statusIsNotable ? ` ⚠️ status: ${status}` : '';
+    const location = [r.city, r.country].filter(Boolean).join(', ');
+    const notes = r.stage_notes ? ` (${r.stage_notes})` : '';
+    // prospect_email stays in the display text (not just dropped for tidiness)
+    // — "find by name, then use their real email" is a documented rule above
+    // that depends on the email actually being visible in onboarding_list output.
+    return [
+      `**${r.prospect_name}** (${r.prospect_email ?? 'no email on file'}) — ${obRef(r.id)}`,
+      `Chapter: ${chapterName}${chapterName && location ? ' — ' : ''}${location}${statusSuffix}`,
+      `Stage: ${r.stage}${notes}`,
+      `Last contact: ${formatUtc(r.last_contact_at)}`,
+    ].join('\n');
+  }
+
+  // The directive is colocated with the data itself, not just stated once in
+  // the system prompt — a system-prompt-only "relay this verbatim" rule was
+  // confirmed present and understood (the agent could recite it correctly
+  // when asked directly) but still routinely lost to the model's own default
+  // instinct to re-summarize tool output in its own words on a plain request.
+  // Repeating the instruction right next to the content, at the exact point
+  // the model composes its reply, is a stronger signal than a rule stated
+  // once, earlier, and disconnected from this specific tool call.
+  const VERBATIM_DIRECTIVE =
+    '[Relay the record list below to the admin exactly as written — same line breaks, same OB- references, same chapter names, same wording. Do not paraphrase, reformat, condense to one line per record, drop any field, or offer a CSV/JSON export instead.]';
+
+  function formatPipelineList(data: unknown): string | undefined {
+    const records = (data as { success?: boolean; data?: PipelineRecordLike[] })?.data;
+    if (!Array.isArray(records)) return undefined;
+    if (records.length === 0) return 'No pipeline records found.';
+    const body = `${records.length} record${records.length === 1 ? '' : 's'}:\n\n${records.map(formatPipelineRecord).join('\n\n')}`;
+    return `${VERBATIM_DIRECTIVE}\n\n${body}`;
+  }
+
+  // Out-of-order stage transition check for onboarding_advance. Same rationale
+  // as the list-formatting directive above: the prose version of this rule
+  // ("check current stage, confirm before an out-of-order transition") was
+  // confirmed not held live (2026-07-28 — advanced invited straight to
+  // verified, skipping following_up/meeting_scheduled, with no mention to the
+  // admin, despite having just fetched the current stage via onboarding_get).
+  // The stage sequence is fixed and well-defined, so the check itself can be
+  // deterministic even though the *decision* whether to proceed anyway stays
+  // with the agent — this only guarantees the mismatch is surfaced, not that
+  // the transition is blocked (skipping can be legitimate, per the existing
+  // doc: "a meeting could have been missed, or steps could have happened
+  // somewhere you can't see").
+  const STAGE_ORDER = [
+    'referred',
+    'invited',
+    'following_up',
+    'meeting_scheduled',
+    'verified',
+    'live_instructions',
+    'nagging',
+    'active',
+  ];
+  const TERMINAL_SIDE_STAGES = new Set(['declined', 'unresponsive']);
+
+  // Transitions documented as legitimate elsewhere in this file/onboarding-procedures.md,
+  // beyond the plain "next stage in STAGE_ORDER" case — an allowlist, not a pure
+  // sequence check, specifically because a naive sequence check would false-positive
+  // on real, common, already-documented flows: flow #2 allows invited -> meeting_scheduled
+  // directly (a prospect can reply before any follow-up was ever sent), and flow #6's
+  // daily sweep does same-stage "touches" (following_up->following_up, nagging->nagging)
+  // just to log contact, which is handled separately below, not via this set.
+  const ALLOWED_EXTRA_TRANSITIONS = new Set([
+    'invited->meeting_scheduled', // flow #2: reply arrives before any follow-up was sent
+  ]);
+
+  function stageTransitionWarning(fromStage: string, toStage: string): string | undefined {
+    if (fromStage === toStage) return undefined; // same-stage "log contact" touch (flow #6) — always fine
+    if (TERMINAL_SIDE_STAGES.has(fromStage) || TERMINAL_SIDE_STAGES.has(toStage)) return undefined;
+    if (ALLOWED_EXTRA_TRANSITIONS.has(`${fromStage}->${toStage}`)) return undefined;
+    const fromIdx = STAGE_ORDER.indexOf(fromStage);
+    const toIdx = STAGE_ORDER.indexOf(toStage);
+    if (fromIdx === -1 || toIdx === -1 || toIdx === fromIdx + 1) return undefined;
+    if (toIdx < fromIdx) {
+      return `[NOTICE: this moves the record backward — from "${fromStage}" to "${toStage}". No documented flow does this; confirm it was actually intended and mention it to the admin explicitly, don't report it as routine.]`;
+    }
+    const skipped = STAGE_ORDER.slice(fromIdx + 1, toIdx).join(', ');
+    return `[NOTICE: this skips ahead from "${fromStage}" directly to "${toStage}", bypassing the normal intermediate stage(s) (${skipped}). This can be legitimate, but you must say so explicitly in your reply to the admin — don't report this as a routine transition.]`;
   }
 
   async function apiGet(path: string, params?: Record<string, string | number | undefined>): Promise<unknown> {
@@ -143,6 +269,30 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       throw new Error(`${res.status}: ${String(message)}`);
     }
     return json;
+  }
+
+  const PROCESSING_DISABLED_MESSAGE =
+    'Onboarding processing is currently disabled. To resume, re-enable it via the MonDAI admin panel → Community Manager → Onboarding config tab.';
+
+  // Enable/disable gate for every tool that mutates pipeline state or sends
+  // something (email, Telegram). Enforced here, in code, rather than left to
+  // the agent to remember to check onboarding_get_settings first — a prose-only
+  // check in onboarding-procedures.md was proven unreliable in live testing
+  // (2026-07-25 to -27: the scheduled daily sweep and weekly digest both ran
+  // normally for three days straight while active=false server-side; nothing
+  // was actually sent only because the pipeline was empty and an unrelated
+  // flag also happened to be off — not because the check held).
+  // Fails open (treats as enabled) on a settings-check error — a transient
+  // hiccup must not block legitimate work indefinitely; only an explicit
+  // `active === false` blocks the call.
+  async function requireActive(): Promise<string | undefined> {
+    try {
+      const settings = (await apiGet('/agent/onboarding/settings')) as { data?: { active?: boolean } };
+      if (settings?.data?.active === false) return PROCESSING_DISABLED_MESSAGE;
+      return undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // Calls skillscript-runtime's execute_skill over its RPC endpoint and
@@ -196,7 +346,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             stage: args.stage as string | undefined,
             email: args.email as string | undefined,
           });
-          return ok(JSON.stringify(data, null, 2));
+          return ok(formatPipelineList(data) ?? JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -248,12 +398,13 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     {
       tool: {
         name: 'onboarding_create',
-        description: 'Create a new chapter onboarding pipeline entry and a linked "planned" chapter. Check onboarding_list first to avoid creating a duplicate for the same prospect.',
+        description: 'Create a new chapter onboarding pipeline entry and a linked chapter (status "onboarding"). Check onboarding_list first to avoid creating a duplicate for the same prospect. The API checks for an existing chapter by exact `name` (not `city`) — a city can legitimately host more than one chapter, e.g. "New York City - Wall Street" and "New York City - Uptown".',
         inputSchema: {
           type: 'object',
           properties: {
             prospect_name: { type: 'string' },
             prospect_email: { type: 'string' },
+            name: { type: 'string', description: 'The chapter\'s own name, if it differs from the city (e.g. "BitcoinMondays El Salvador", "Zoom (Europe)", "New York City - Wall Street"). Omit only when the chapter name genuinely is just the city — the API defaults to "{city} Chapter" if omitted, which is not always right. Confirm with the admin which one they mean before deciding.' },
             city: { type: 'string' },
             country: { type: 'string' },
           },
@@ -262,10 +413,13 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/create', {
             prospect_name: args.prospect_name as string,
             prospect_email: args.prospect_email as string,
+            name: args.name as string | undefined,
             city: args.city as string | undefined,
             country: args.country as string | undefined,
           });
@@ -292,7 +446,19 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
+          let warning: string | undefined;
+          try {
+            const current = (await apiGet(`/agent/onboarding/get/${args.id as string}`)) as {
+              data?: { stage?: string };
+            };
+            if (current?.data?.stage) warning = stageTransitionWarning(current.data.stage, args.stage as string);
+          } catch {
+            // Pre-check fetch failing shouldn't block the actual advance attempt.
+          }
+          const prefix = warning ? `${warning}\n\n` : '';
           if (SKILLSCRIPT_RPC_URL) {
             const vars = await executeSkill('onboarding-advance', {
               ID: args.id as string,
@@ -300,14 +466,14 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
               NOTES: (args.notes as string | undefined) ?? '',
               BASE_URL: BASE_URL as string,
             });
-            return ok(JSON.stringify({ success: vars.SUCCESS === 'true', stage: vars.NEW_STAGE }, null, 2));
+            return ok(`${prefix}${JSON.stringify({ success: vars.SUCCESS === 'true', stage: vars.NEW_STAGE }, null, 2)}`);
           }
           const data = await apiPost('/agent/onboarding/advance', {
             id: args.id as string,
             stage: args.stage as string,
             notes: args.notes as string | undefined,
           });
-          return ok(JSON.stringify(data, null, 2));
+          return ok(`${prefix}${JSON.stringify(data, null, 2)}`);
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -334,6 +500,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           // The skillscript path only covers the normal (no override) case —
           // a deliberate `variables` override still goes straight to the API.
@@ -371,6 +539,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/link-luma', {
             id: args.id as string,
@@ -384,24 +554,79 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       },
     },
 
+    // Only registered when SKILLSCRIPT_RPC_URL is configured — there is no
+    // inline-TypeScript fallback, deliberately. That fallback is exactly the
+    // agent-driven multi-step sequence this tool exists to replace (2026-07-28:
+    // left as separate steps, flow #4 repeatedly produced a redundant advance
+    // call, a silently-skipped calendar-manager notify, and records stuck at
+    // live_instructions). If skillscript isn't configured, the old manual
+    // sequence in onboarding-procedures.md flow #4 is the only path — that
+    // documentation stays as the fallback, not a redundant restatement.
+    ...(SKILLSCRIPT_RPC_URL
+      ? ([
+          {
+            tool: {
+              name: 'onboarding_go_live',
+              description:
+                'Atomic "save Luma link and go live" action for a verified chapter — links the Luma calendar, renders and sends the go-live email to the prospect, notifies the calendar manager via whichever of Telegram/email is actually configured (both independently, checked fresh every call), and advances the record to `nagging`. Replaces the whole flow #4 sequence (onboarding_link_luma + onboarding_render_template + mcp__gmail__send_email + onboarding_get_settings + onboarding_notify_telegram + onboarding_advance as separate calls) with one deterministic call — use this instead of doing those steps yourself.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  calendar_url: { type: 'string' },
+                },
+                required: ['id', 'calendar_url'],
+                additionalProperties: false,
+              },
+            },
+            async handler(args) {
+              const blocked = await requireActive();
+              if (blocked) return err(blocked);
+              try {
+                const vars = await executeSkill('onboarding-go-live', {
+                  ID: args.id as string,
+                  CALENDAR_URL: args.calendar_url as string,
+                  BASE_URL: BASE_URL as string,
+                });
+                return ok(JSON.stringify(vars, null, 2));
+              } catch (e) {
+                return err(e instanceof Error ? e.message : String(e));
+              }
+            },
+          },
+          {
+            tool: {
+              name: 'onboarding_daily_sweep',
+              description:
+                'Core of the daily pipeline sweep (flow #6) — for every prospect currently overdue (per /agent/onboarding/stalled), sends the matching follow-up or nag email and touches/advances the stage to log contact, or marks the prospect unresponsive and notifies every configured admin once the follow-up/nag limit is reached. Deterministic, server-side, one call covers the whole per-record loop — use this instead of fetching onboarding_stalled and looping yourself. Does NOT handle the Gmail "Needs-Admin" label scan, the daily-summary dispatch, or relabeling — do those as separate steps after this returns, same as before.',
+              inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+            },
+            async handler() {
+              const blocked = await requireActive();
+              if (blocked) return err(blocked);
+              try {
+                const vars = await executeSkill('onboarding-daily-sweep', {
+                  BASE_URL: BASE_URL as string,
+                });
+                return ok(JSON.stringify(vars, null, 2));
+              } catch (e) {
+                return err(e instanceof Error ? e.message : String(e));
+              }
+            },
+          },
+        ] as McpToolDefinition[])
+      : []),
+
     {
       tool: {
         name: 'onboarding_get_settings',
-        description: 'Fetch environment-level onboarding settings, including the calendar manager\'s current Telegram ID (`cal_mgr_telegram_id`). The calendar manager is a role, not a fixed person — always look this up fresh rather than remembering a previously-seen ID, since whoever holds the role can change.',
+        description: 'Fetch environment-level onboarding settings, including the calendar manager\'s current Telegram ID (`cal_mgr_telegram_id`) and email (`cal_mgr_email`) — two independent notification channels, check and use each one separately, whichever is actually populated — and whether onboarding processing is enabled (`active`). The calendar manager is a role, not a fixed person — always look this up fresh rather than remembering a previously-seen ID/email, since whoever holds the role can change. Check `active` before any admin-requested mutation — see onboarding-procedures.md.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       async handler() {
         try {
-          if (!WEBAPP_SHARED_SECRET) return err('WEBAPP_SHARED_SECRET not configured for this container');
-          const res = await fetch(`${BASE_URL}/agent/onboarding/settings`, {
-            headers: { 'x-shared-secret': WEBAPP_SHARED_SECRET },
-          });
-          const json = await res.json().catch(() => null);
-          if (!res.ok) {
-            const message = (json as Record<string, unknown>)?.message ?? JSON.stringify(json) ?? res.statusText;
-            throw new Error(`${res.status}: ${String(message)}`);
-          }
-          return ok(JSON.stringify(json, null, 2));
+          const data = await apiGet('/agent/onboarding/settings');
+          return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -423,32 +648,13 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/notify-telegram', {
             telegram_id: args.telegram_id as string,
             text: args.text as string,
           });
-          return ok(JSON.stringify(data, null, 2));
-        } catch (e) {
-          return err(e instanceof Error ? e.message : String(e));
-        }
-      },
-    },
-
-    {
-      tool: {
-        name: 'onboarding_generate_invite_link',
-        description: 'Generate a one-time, 24-hour Telegram invite link to the Chapter Champions group for a verified prospect. Returns the existing cached link if one was already generated for this record.',
-        inputSchema: {
-          type: 'object',
-          properties: { id: { type: 'string' } },
-          required: ['id'],
-          additionalProperties: false,
-        },
-      },
-      async handler(args) {
-        try {
-          const data = await apiPost('/agent/onboarding/generate-invite-link', { id: args.id as string });
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
@@ -468,6 +674,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/set-active', { id: args.id as string });
           return ok(JSON.stringify(data, null, 2));
@@ -489,6 +697,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         },
       },
       async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/mark-unresponsive', { id: args.id as string });
           return ok(JSON.stringify(data, null, 2));
@@ -521,6 +731,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       async handler() {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiGet('/agent/onboarding/daily-summary');
           return ok(JSON.stringify(data, null, 2));
@@ -537,6 +749,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       async handler() {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
         try {
           const data = await apiGet('/agent/onboarding/weekly-summary');
           return ok(JSON.stringify(data, null, 2));
