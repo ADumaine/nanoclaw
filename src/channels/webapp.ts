@@ -297,6 +297,18 @@ registerChannelAdapter(CHANNEL_TYPE, {
         threadId: string | null,
         message: OutboundMessage,
       ): Promise<string | undefined> {
+        // Refuse rather than send a callback with no thread_id. The API server's
+        // own behavior on a missing thread_id is to fall back to guessing the
+        // user's most-recently-active session — which silently misattributes
+        // the message to an unrelated chat rather than failing loudly. Confirmed
+        // live 2026-07-27: an onboarding-agent test message landed in the
+        // operator's Community Assistant chat history this way. Dropping here
+        // (best-effort, matches the existing catch-block contract below) is
+        // safer than shipping a callback we know will be misrouted.
+        if (!threadId) {
+          log.error('Webapp: refusing to deliver — no thread_id resolved', { platformId });
+          return undefined;
+        }
         try {
           const raw = message.content as Record<string, unknown> | null;
           const contentText: string = typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
@@ -333,6 +345,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
       },
 
       async setTyping(platformId: string, threadId: string | null): Promise<void> {
+        if (!threadId) return; // same misrouting risk as deliver() above — silently skip
         try {
           const appId = platformId.startsWith(`${CHANNEL_TYPE}:`)
             ? platformId.slice(CHANNEL_TYPE.length + 1)
