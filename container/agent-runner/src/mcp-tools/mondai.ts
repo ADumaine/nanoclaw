@@ -17,6 +17,7 @@
  *   update_chapter        — update chapter description, co-organizers, links (lead or admin)
  *   send_email            — send an email via the API server (Mailgun) to one or more recipients
  */
+import { loadConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -25,6 +26,17 @@ const APP_URL = process.env.CM_APP_URL?.replace(/\/$/, '') ?? '';
 // CM_AGENT_TOKEN is the NanoClaw shared secret — API server assigns system_agent role.
 // Falls back to CM_API_TOKEN for deployments that haven't set CM_AGENT_TOKEN yet.
 const API_TOKEN = process.env.CM_AGENT_TOKEN ?? process.env.CM_API_TOKEN;
+
+// cm-onboarding has its own dedicated, correct email path (mcp__gmail__send_email
+// via onboarding_render_template) and must not also see this tool: both are
+// literally named `send_email`, live in the same shared "nanoclaw" MCP
+// subprocess (so allowedTools' server-level gating can't separate them), and
+// take incompatible parameter shapes (`recipients`/`htmlBody` here vs
+// `to`/`body`/`mimeType` on the Gmail tool). Confirmed live 2026-07-27: the
+// onboarding agent called this one by mistake with Gmail's parameter shape and
+// got "recipients is required" — a real, reproduced collision, not a theoretical one.
+const ONBOARDING_AGENT_GROUP_ID = process.env.CM_ONBOARDING_AGENT_GROUP_ID;
+const IS_ONBOARDING_AGENT = !!ONBOARDING_AGENT_GROUP_ID && loadConfig().agentGroupId === ONBOARDING_AGENT_GROUP_ID;
 
 if (!BASE_URL) {
   // Skip registration silently — not a MonDAI deployment.
@@ -405,43 +417,48 @@ if (!BASE_URL) {
         }
       },
     },
-    {
-      tool: {
-        name: 'send_email',
-        description: `Send an email via the API server (Mailgun) to one or more recipients.
+    // Excluded entirely for cm-onboarding — see IS_ONBOARDING_AGENT comment above.
+    ...(IS_ONBOARDING_AGENT
+      ? []
+      : ([
+          {
+            tool: {
+              name: 'send_email',
+              description: `Send an email via the API server (Mailgun) to one or more recipients.
 IMPORTANT: Only honour this request from users with admin or sysadmin role.
 Before calling this tool, always show the full recipient list and subject to the user.
 If the recipient count exceeds 5, explicitly ask for confirmation ("You are about to send to N recipients — send as-is, edit the list, or cancel?") and wait for a reply before proceeding.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            recipients: {
-              oneOf: [
-                { type: 'string', description: 'Single recipient email address.' },
-                { type: 'array', items: { type: 'string' }, description: 'Multiple recipient email addresses.' },
-              ],
-              description: 'Recipient email address(es).',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  recipients: {
+                    oneOf: [
+                      { type: 'string', description: 'Single recipient email address.' },
+                      { type: 'array', items: { type: 'string' }, description: 'Multiple recipient email addresses.' },
+                    ],
+                    description: 'Recipient email address(es).',
+                  },
+                  subject: { type: 'string' },
+                  htmlBody: { type: 'string', description: 'HTML content of the email.' },
+                },
+                required: ['recipients', 'subject', 'htmlBody'],
+                additionalProperties: false,
+              },
             },
-            subject: { type: 'string' },
-            htmlBody: { type: 'string', description: 'HTML content of the email.' },
+            async handler(args) {
+              try {
+                const data = await apiPost('/email/send', {
+                  recipients: args.recipients,
+                  subject: args.subject as string,
+                  htmlBody: args.htmlBody as string,
+                });
+                return ok(JSON.stringify(data, null, 2));
+              } catch (e) {
+                return err(e instanceof Error ? e.message : String(e));
+              }
+            },
           },
-          required: ['recipients', 'subject', 'htmlBody'],
-          additionalProperties: false,
-        },
-      },
-      async handler(args) {
-        try {
-          const data = await apiPost('/email/send', {
-            recipients: args.recipients,
-            subject: args.subject as string,
-            htmlBody: args.htmlBody as string,
-          });
-          return ok(JSON.stringify(data, null, 2));
-        } catch (e) {
-          return err(e instanceof Error ? e.message : String(e));
-        }
-      },
-    },
+        ] as McpToolDefinition[])),
   ];
 
   registerTools(tools);
