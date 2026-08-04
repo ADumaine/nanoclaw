@@ -11,6 +11,7 @@
  * tool just writes the outbound request; authorization is enforced host-side,
  * not here — the container is untrusted and cannot be relied on to gate itself.
  */
+import { loadConfig } from '../config.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { registerHiddenTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -66,4 +67,8 @@ export const createAgent: McpToolDefinition = {
   },
 };
 
-registerHiddenTools([createAgent]);
+// See self-mod.ts for why this check exists at registration, not just in
+// the CLAUDE.md instructions fragment.
+if (!loadConfig().disabledModules.includes('agents')) {
+  registerHiddenTools([createAgent]);
+}

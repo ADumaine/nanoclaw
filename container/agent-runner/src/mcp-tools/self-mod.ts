@@ -12,6 +12,7 @@
  * Package names are sanitized here at the tool boundary AND re-validated on
  * the host side (defense in depth).
  */
+import { loadConfig } from '../config.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { registerHiddenTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -117,4 +118,11 @@ export const addMcpServer: McpToolDefinition = {
   },
 };
 
-registerHiddenTools([installPackages, addMcpServer]);
+// disabled_modules gates registration itself, not just the CLAUDE.md
+// instructions fragment — a "hidden" tool is still callable via the
+// discover_tools/call_tool proxy even when undocumented, so previously
+// disabling this module only stopped the agent from being *taught* about
+// these tools, not from finding and calling them.
+if (!loadConfig().disabledModules.includes('self-mod')) {
+  registerHiddenTools([installPackages, addMcpServer]);
+}

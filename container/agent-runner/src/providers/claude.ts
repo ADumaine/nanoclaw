@@ -4,6 +4,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { loadConfig } from '../config.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -60,6 +61,20 @@ const TOOL_ALLOWLIST = [
   'Skill',
   'NotebookEdit',
 ];
+
+// SDK built-ins gated by the "agents" module — spawning/managing subagents
+// is meaningless without it, and previously these were sent unconditionally
+// to every agent group regardless of disabled_modules (the module-fragment
+// exclusion in claude-md-compose.ts only ever controlled the *instructions*
+// describing them, never actual tool availability).
+const AGENTS_MODULE_TOOLS = ['Task', 'TaskOutput', 'TaskStop', 'TeamCreate', 'TeamDelete'];
+
+/** TOOL_ALLOWLIST filtered by this container's disabled_modules (container.json). */
+function effectiveToolAllowlist(): string[] {
+  const disabled = loadConfig().disabledModules;
+  if (!disabled.includes('agents')) return TOOL_ALLOWLIST;
+  return TOOL_ALLOWLIST.filter((t) => !AGENTS_MODULE_TOOLS.includes(t));
+}
 
 // MCP server names are sanitized by the SDK when forming tool prefixes:
 // any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
@@ -405,7 +420,7 @@ export class ClaudeProvider implements AgentProvider {
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
-          ...TOOL_ALLOWLIST,
+          ...effectiveToolAllowlist(),
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
