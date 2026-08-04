@@ -10,14 +10,28 @@
 import { execFileSync } from 'child_process';
 
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { readEnvFile } from './env.js';
 import { log } from './log.js';
 
+// .env is deliberately never loaded into process.env (see env.ts) — these
+// must be read fresh via readEnvFile, not process.env, or they silently
+// always read as unset regardless of what's in .env. (Previously all three
+// read process.env directly, so NANOCLAW_EGRESS_LOCKDOWN=true in .env had
+// no effect — same class of bug as the SKILLSCRIPT_RPC_URL and
+// CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS fixes earlier.)
+
 /** Locked-down, no-internet network agents are placed on. */
-export const EGRESS_NETWORK = process.env.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
+export function egressNetwork(): string {
+  return readEnvFile(['NANOCLAW_EGRESS_NETWORK'])['NANOCLAW_EGRESS_NETWORK'] || 'nanoclaw-egress';
+}
 /** The OneCLI gateway container attached as the only egress hop. */
-const ONECLI_GATEWAY_CONTAINER = process.env.ONECLI_GATEWAY_CONTAINER || 'onecli';
+function onecliGatewayContainer(): string {
+  return readEnvFile(['ONECLI_GATEWAY_CONTAINER'])['ONECLI_GATEWAY_CONTAINER'] || 'onecli';
+}
 /** Off by default; set NANOCLAW_EGRESS_LOCKDOWN=true to opt in. */
-const EGRESS_LOCKDOWN = process.env.NANOCLAW_EGRESS_LOCKDOWN === 'true';
+function egressLockdownEnabled(): boolean {
+  return readEnvFile(['NANOCLAW_EGRESS_LOCKDOWN'])['NANOCLAW_EGRESS_LOCKDOWN'] === 'true';
+}
 
 /** Raised when lockdown is requested but can't be established. */
 export class EgressLockdownError extends Error {
@@ -25,7 +39,7 @@ export class EgressLockdownError extends Error {
     super(
       `Egress lockdown is on (NANOCLAW_EGRESS_LOCKDOWN=true) but ${reason}. ` +
         `Refusing to spawn with open egress. Start the OneCLI gateway container ` +
-        `"${ONECLI_GATEWAY_CONTAINER}", or set NANOCLAW_EGRESS_LOCKDOWN=false to opt out.`,
+        `"${onecliGatewayContainer()}", or set NANOCLAW_EGRESS_LOCKDOWN=false to opt out.`,
     );
     this.name = 'EgressLockdownError';
   }
@@ -41,14 +55,14 @@ function dockerOk(args: string[]): boolean {
 }
 
 /** Is the OneCLI gateway currently attached to the egress network? */
-function gatewayAttached(): boolean {
+function gatewayAttached(network: string, gateway: string): boolean {
   try {
     const out = execFileSync(
       CONTAINER_RUNTIME_BIN,
-      ['network', 'inspect', EGRESS_NETWORK, '--format', '{{range .Containers}}{{.Name}} {{end}}'],
+      ['network', 'inspect', network, '--format', '{{range .Containers}}{{.Name}} {{end}}'],
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8', timeout: 15000 },
     );
-    return out.split(/\s+/).includes(ONECLI_GATEWAY_CONTAINER);
+    return out.split(/\s+/).includes(gateway);
   } catch {
     return false;
   }
@@ -62,34 +76,29 @@ function gatewayAttached(): boolean {
  * spawn an agent with open egress.
  */
 export function ensureEgressNetwork(): boolean {
-  if (!EGRESS_LOCKDOWN) return false;
+  if (!egressLockdownEnabled()) return false;
 
-  if (
-    !dockerOk(['network', 'inspect', EGRESS_NETWORK]) &&
-    !dockerOk(['network', 'create', '--internal', EGRESS_NETWORK])
-  ) {
-    throw new EgressLockdownError(`the "${EGRESS_NETWORK}" internal network could not be created`);
+  const network = egressNetwork();
+  const gateway = onecliGatewayContainer();
+
+  if (!dockerOk(['network', 'inspect', network]) && !dockerOk(['network', 'create', '--internal', network])) {
+    throw new EgressLockdownError(`the "${network}" internal network could not be created`);
   }
 
-  if (gatewayAttached()) return true;
+  if (gatewayAttached(network, gateway)) return true;
 
   if (
-    dockerOk(['network', 'connect', '--alias', 'host.docker.internal', EGRESS_NETWORK, ONECLI_GATEWAY_CONTAINER]) &&
-    gatewayAttached()
+    dockerOk(['network', 'connect', '--alias', 'host.docker.internal', network, gateway]) &&
+    gatewayAttached(network, gateway)
   ) {
-    log.info('Egress lockdown: OneCLI gateway attached', {
-      network: EGRESS_NETWORK,
-      gateway: ONECLI_GATEWAY_CONTAINER,
-    });
+    log.info('Egress lockdown: OneCLI gateway attached', { network, gateway });
     return true;
   }
 
-  throw new EgressLockdownError(
-    `the OneCLI gateway "${ONECLI_GATEWAY_CONTAINER}" could not be attached to "${EGRESS_NETWORK}"`,
-  );
+  throw new EgressLockdownError(`the OneCLI gateway "${gateway}" could not be attached to "${network}"`);
 }
 
 /** CLI args placing a container on the locked-down egress network. */
 export function egressNetworkArgs(): string[] {
-  return ['--network', EGRESS_NETWORK];
+  return ['--network', egressNetwork()];
 }

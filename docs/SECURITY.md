@@ -125,6 +125,64 @@ pip, curl, node/bun with the proxy env) are unaffected. Any workflow that relies
 on a **non-proxy-aware** tool reaching the internet directly will fail by design.
 Lockdown is **off by default**; opt in with `NANOCLAW_EGRESS_LOCKDOWN=true`.
 
+**Gotcha — the three env vars above must come from `.env`, not `process.env`.**
+`.env` is deliberately never loaded into the host process's environment (see
+`src/env.ts`) — code must read them via `readEnvFile(['NANOCLAW_EGRESS_LOCKDOWN'])`
+(or the `egressLockdownEnabled()` / `egressNetwork()` / `onecliGatewayContainer()`
+helpers in `src/egress-lockdown.ts`), never `process.env.NANOCLAW_EGRESS_LOCKDOWN`
+directly. Reading `process.env` here silently always evaluates to unset, so
+`NANOCLAW_EGRESS_LOCKDOWN=true` in `.env` would have no effect and lockdown would
+never actually engage, with no error to point at why.
+
+### Reaching a *local* Docker-hosted service from a locked-down agent
+
+Lockdown's network (`nanoclaw-egress`, `--internal`) has exactly one other
+member: the OneCLI gateway container, attached with alias `host.docker.internal`.
+That alias is scoped to *this network* — it means "the OneCLI gateway
+container," not "the host machine," which is the opposite of what
+`host.docker.internal` means everywhere else (outside lockdown, via
+`hostGatewayArgs()`, it really does reach the host). Any code that rewrites a
+`.env`-configured `localhost`/`127.0.0.1` URL to `host.docker.internal` (the
+`rewriteLocalhostUrl()` pattern in `src/container-runner.ts`, used for
+`CM_API_BASE_URL`, `ANTHROPIC_BASE_URL`, `SKILLSCRIPT_RPC_URL`, etc.) will
+silently point at the gateway instead of the intended service once lockdown is
+on — a plain HTTP URL doesn't even get a chance to go through OneCLI's injected
+`HTTPS_PROXY` first, since that only covers `https://` targets. The result looks
+like a generic connection-refused/backend error with no obvious link to
+lockdown.
+
+**General fix pattern for any locally-Dockerized service an agent needs to
+reach under lockdown** (confirmed working for skillscript-runtime — see
+`docs/mondai/chapter-onboarding-skillscript-setup.md`):
+
+1. Attach that service's own container to `nanoclaw-egress` too, so it's
+   reachable by Docker DNS on the same network the agent is confined to.
+   One-off: `docker network connect nanoclaw-egress <service-container-name>`.
+   Persist it in that service's own `docker-compose.yml`:
+   ```yaml
+   services:
+     <service>:
+       networks:
+         - default            # keep its own existing network(s)
+         - nanoclaw-egress
+   networks:
+     default: {}
+     nanoclaw-egress:
+       external: true          # created by NanoClaw; must already exist
+   ```
+2. In the NanoClaw code that forwards that service's URL into the container's
+   env (`src/container-runner.ts`), rewrite `localhost`/`127.0.0.1` to the
+   **service's container name** when `ensureEgressNetwork()`/`egressLocked` is
+   true — not `host.docker.internal`. `rewriteLocalhostUrl()` takes an optional
+   target-hostname param for exactly this; see `SKILLSCRIPT_EGRESS_HOSTNAME` for
+   the reference implementation.
+3. Verify from a throwaway container on the same network before trusting it:
+   `docker run --rm --network nanoclaw-egress curlimages/curl:latest curl -sv http://<service-container-name>:<port>/`.
+
+This has to be done per integration point today — there's no generic registry
+of "local services agents may reach"; each one needs its own container-name
+rewrite added alongside whatever env var carries its URL.
+
 ## Privilege Comparison
 
 | Capability | Main Group | Non-Main Group |

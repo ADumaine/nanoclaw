@@ -26,7 +26,7 @@ import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
-import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
+import { egressNetwork, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -478,11 +478,11 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     : [];
 }
 
-function rewriteLocalhostUrl(value: string): string {
+function rewriteLocalhostUrl(value: string, target = 'host.docker.internal'): string {
   try {
     const u = new URL(value);
     if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
-      u.hostname = 'host.docker.internal';
+      u.hostname = target;
       return u.toString();
     }
   } catch {
@@ -490,6 +490,13 @@ function rewriteLocalhostUrl(value: string): string {
   }
   return value;
 }
+
+// Under egress lockdown, host.docker.internal is aliased to the OneCLI
+// gateway container on the internal egress network, not the real host —
+// skillscript-dashboard doesn't listen there. It's attached to that same
+// network specifically so its own container name resolves instead. Outside
+// lockdown, host.docker.internal (via hostGatewayArgs) still works normally.
+const SKILLSCRIPT_EGRESS_HOSTNAME = 'skillscript-dashboard';
 
 async function buildContainerArgs(
   mounts: VolumeMount[],
@@ -511,6 +518,10 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Computed early: the SKILLSCRIPT_RPC_URL rewrite below and the noProxyHosts
+  // logic further down both depend on whether egress lockdown is active.
+  const egressLocked = ensureEgressNetwork();
 
   // Forward CM_* vars from host env so container MCP tools can reach the CM API.
   // Per-app_id overrides (CM_API_BASE_URL_<app_id>, CM_API_TOKEN_<app_id>, etc.)
@@ -536,7 +547,10 @@ async function buildContainerArgs(
   // render/advance steps through skillscript-runtime's execute_skill when set.
   const skillscriptRpcUrl = readEnvFile(['SKILLSCRIPT_RPC_URL'])['SKILLSCRIPT_RPC_URL'];
   if (skillscriptRpcUrl) {
-    args.push('-e', `SKILLSCRIPT_RPC_URL=${rewriteLocalhostUrl(skillscriptRpcUrl)}`);
+    const rewritten = egressLocked
+      ? rewriteLocalhostUrl(skillscriptRpcUrl, SKILLSCRIPT_EGRESS_HOSTNAME)
+      : rewriteLocalhostUrl(skillscriptRpcUrl);
+    args.push('-e', `SKILLSCRIPT_RPC_URL=${rewritten}`);
   }
 
   // Forward CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS so a state-driven agent group
@@ -577,42 +591,55 @@ async function buildContainerArgs(
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
   // the spawn rather than running with open egress. Otherwise the host gateway.
-  if (ensureEgressNetwork()) {
+  // (egressLocked computed earlier, before the SKILLSCRIPT_RPC_URL rewrite.)
+  if (egressLocked) {
     args.push(...egressNetworkArgs());
-    log.info('Egress lockdown active', { containerName, network: EGRESS_NETWORK });
+    log.info('Egress lockdown active', { containerName, network: egressNetwork() });
   } else {
     args.push(...hostGatewayArgs());
   }
 
-  // Bypass the OneCLI proxy for local services that handle their own auth.
+  // Bypass the OneCLI proxy for local services that handle their own auth —
+  // but only when NOT under egress lockdown. Under lockdown the container's
+  // only network route at all is the gateway (an --internal Docker network),
+  // so telling it to bypass the proxy for these hosts doesn't reach them
+  // directly the way it does in normal operation — it just fails at the
+  // socket level before ever reaching OneCLI, since there's no route to
+  // bypass *to*. (Confirmed live: this caused every LLM proxy call under
+  // lockdown to fail with "FailedToOpenSocket", invisible in the gateway's
+  // own logs because the request never got that far — not a credential or
+  // OneCLI-connection problem, this was it.) Under lockdown these hosts must
+  // stay routed through the gateway so OneCLI can actually forward them.
   const noProxyHosts = ['localhost', '127.0.0.1'];
-  const cmApiUrl = readEnvFile(['CM_API_BASE_URL'])['CM_API_BASE_URL'];
-  if (cmApiUrl) {
-    try {
-      noProxyHosts.push(new URL(cmApiUrl).hostname);
-    } catch {
-      /* ignore malformed URL */
+  if (!egressLocked) {
+    const cmApiUrl = readEnvFile(['CM_API_BASE_URL'])['CM_API_BASE_URL'];
+    if (cmApiUrl) {
+      try {
+        noProxyHosts.push(new URL(cmApiUrl).hostname);
+      } catch {
+        /* ignore malformed URL */
+      }
     }
-  }
-  if (skillscriptRpcUrl) {
-    try {
-      // Hostname after rewrite (localhost -> host.docker.internal), since
-      // that's the hostname the container actually connects to.
-      const h = new URL(rewriteLocalhostUrl(skillscriptRpcUrl)).hostname;
-      if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
-    } catch {
-      /* ignore malformed URL */
+    if (skillscriptRpcUrl) {
+      try {
+        // Hostname after rewrite (localhost -> host.docker.internal), since
+        // that's the hostname the container actually connects to.
+        const h = new URL(rewriteLocalhostUrl(skillscriptRpcUrl)).hostname;
+        if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
+      } catch {
+        /* ignore malformed URL */
+      }
     }
-  }
-  // If ANTHROPIC_BASE_URL points to a local LLM proxy it must also bypass OneCLI,
-  // otherwise OneCLI intercepts the request and the proxy never receives it.
-  const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
-  if (anthropicBaseUrl) {
-    try {
-      const h = new URL(anthropicBaseUrl).hostname;
-      if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
-    } catch {
-      /* ignore malformed URL */
+    // If ANTHROPIC_BASE_URL points to a local LLM proxy it must also bypass OneCLI,
+    // otherwise OneCLI intercepts the request and the proxy never receives it.
+    const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    if (anthropicBaseUrl) {
+      try {
+        const h = new URL(anthropicBaseUrl).hostname;
+        if (!noProxyHosts.includes(h)) noProxyHosts.push(h);
+      } catch {
+        /* ignore malformed URL */
+      }
     }
   }
   const noProxy = noProxyHosts.join(',');

@@ -137,6 +137,76 @@ curl -s -X POST http://localhost:7878/rpc -H "Content-Type: application/json" -d
 # Expect a real Gmail message ID in the transcript, and the email to actually arrive.
 ```
 
+## Egress lockdown compatibility (only relevant if `NANOCLAW_EGRESS_LOCKDOWN=true` on that host)
+
+Skip this whole section if that host doesn't set `NANOCLAW_EGRESS_LOCKDOWN=true`
+in NanoClaw's own `.env` — lockdown is opt-in and off by default (see
+`docs/SECURITY.md`'s "Egress Lockdown" section for the general mechanism and
+the local-Docker-service reachability pattern this section applies).
+
+**Symptom this fixes**: `onboarding_daily_sweep` (or `onboarding_go_live`,
+`onboarding_render_template`, `onboarding_advance`) fails with a connection
+error, even though `curl http://localhost:7878/rpc` works fine directly on the
+host. Under lockdown, the cm-onboarding container's only network route is to
+the OneCLI gateway (aliased `host.docker.internal` on the internal
+`nanoclaw-egress` network) — `SKILLSCRIPT_RPC_URL`'s `localhost` rewrite was
+landing on that gateway, which doesn't listen on `7878`, instead of on
+skillscript-dashboard. Root-caused and fixed on dev 2026-08-03 — see
+[[project_chapter_onboarding]] memory for the full incident, or the "Reaching
+a local Docker-hosted service from a locked-down agent" section of
+`docs/SECURITY.md` for the general version of this gotcha.
+
+### Steps to bring this fix to a host that has (or will have) lockdown on
+
+1. **Get the NanoClaw code fix onto that host.** As of this writing the fix
+   (`src/container-runner.ts`: `rewriteLocalhostUrl()` takes a target-hostname
+   param, `SKILLSCRIPT_EGRESS_HOSTNAME = 'skillscript-dashboard'` used when
+   `egressLocked`; `src/egress-lockdown.ts`: reads its three env vars via
+   `readEnvFile()` instead of `process.env` — see the `.env`-loading gotcha in
+   `docs/SECURITY.md`) exists only as an uncommitted change on the dev host.
+   **Commit it to `local/mondai`, push, then on the target host**: `git pull`,
+   `pnpm install --frozen-lockfile`, `pnpm run build` (host-only TypeScript —
+   no container image rebuild needed), `systemctl --user restart <nanoclaw-unit>`.
+2. **Attach `skillscript-dashboard` to the `nanoclaw-egress` network,
+   persisted in that host's own `skillscript-cm/docker-compose.yml`** (this
+   folder is a manual per-host deployment, not git-tracked — see the top of
+   this doc):
+   ```yaml
+   services:
+     dashboard:
+       # ...existing config...
+       networks:
+         - default
+         - nanoclaw-egress
+   networks:
+     default: {}
+     nanoclaw-egress:
+       external: true
+   ```
+   Apply with `docker compose up -d dashboard`. The `nanoclaw-egress` network
+   must already exist on that host before this runs — it's created by
+   NanoClaw itself the first time it spawns a container under lockdown, so
+   bring NanoClaw up (with lockdown already enabled) before bringing
+   skillscript-cm's compose up if starting both fresh.
+3. **Verify**, from a throwaway container on that same network (not from the
+   host directly — the point is confirming what the *agent container* can
+   reach):
+   ```bash
+   docker run --rm --network nanoclaw-egress curlimages/curl:latest \
+     curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://skillscript-dashboard:7878/rpc
+   # Expect 405 (Method Not Allowed — the RPC endpoint is POST-only, so a
+   # bare GET reaching it at all confirms the network path works).
+   ```
+4. **Confirm end-to-end** by triggering `onboarding_daily_sweep` for real (or
+   any skillscript-backed tool) and checking it completes without a
+   connection error — do this with the operator present, since the sweep has
+   real side effects (sends, stage advances) on genuine pipeline records.
+
+If `skillscript-dashboard` isn't the container's actual name on some host
+(check with `docker ps`), substitute the real name in both the compose
+`networks:` block and `SKILLSCRIPT_EGRESS_HOSTNAME` in
+`src/container-runner.ts` — they must match.
+
 ## Quick end-to-end verification
 
 Once running, this confirms the whole chain without sending a real email (render is read-only):
