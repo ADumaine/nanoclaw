@@ -48,6 +48,14 @@
  *   onboarding_get                  — single pipeline record by id
  *   onboarding_lookup               — find record by prospect email (Gmail reply matching)
  *   onboarding_create               — create pipeline entry + planned chapter
+ *   onboarding_evaluate             — preview the stage a chapter would get if switched into
+ *                                      onboarding right now (read-only, no side effects) — use
+ *                                      before onboarding_initiate to check for a lead-mismatch
+ *                                      revival that would reset existing progress
+ *   onboarding_initiate             — switch an existing (manual or inactive) chapter into the
+ *                                      onboarding pipeline; works backwards from what's already
+ *                                      on file to pick a starting stage (or flags needs_attention),
+ *                                      creating the pipeline record if none exists yet
  *   onboarding_advance              — move to next stage, log contact/notes
  *                                      (routes through skillscript's onboarding-advance
  *                                      skill when SKILLSCRIPT_RPC_URL is set — see below)
@@ -163,13 +171,18 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     const statusSuffix = statusIsNotable ? ` ⚠️ status: ${status}` : '';
     const location = [r.city, r.country].filter(Boolean).join(', ');
     const notes = r.stage_notes ? ` (${r.stage_notes})` : '';
+    // needs_attention marks an ambiguous auto-evaluation the API couldn't
+    // resolve on its own (e.g. onboarding triggered with no lead email on
+    // file) — flag it the same way a notable chapter status is flagged, so
+    // it doesn't blend into an ordinary stage list an admin might skim past.
+    const stageDisplay = r.stage === 'needs_attention' ? `⚠️ ${r.stage}` : r.stage;
     // prospect_email stays in the display text (not just dropped for tidiness)
     // — "find by name, then use their real email" is a documented rule above
     // that depends on the email actually being visible in onboarding_list output.
     return [
       `**${r.prospect_name}** (${r.prospect_email ?? 'no email on file'}) — ${obRef(r.id)}`,
       `Chapter: ${chapterName}${chapterName && location ? ' — ' : ''}${location}${statusSuffix}`,
-      `Stage: ${r.stage}${notes}`,
+      `Stage: ${stageDisplay}${notes}`,
       `Last contact: ${formatUtc(r.last_contact_at)}`,
     ].join('\n');
   }
@@ -215,7 +228,13 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     'nagging',
     'active',
   ];
-  const TERMINAL_SIDE_STAGES = new Set(['declined', 'unresponsive']);
+  // Not all "side" stages are terminal — `needs_attention` (added API-side
+  // 2026-08, see the chapter-onboarding stage-evaluation/reset doc) is a
+  // resolvable ambiguity flag, not an end state. It's grouped here anyway
+  // because it isn't part of the linear STAGE_ORDER sequence either, so a
+  // transition into or out of it shouldn't be judged against that sequence
+  // the same way declined/unresponsive already aren't.
+  const SIDE_STAGES = new Set(['declined', 'unresponsive', 'needs_attention']);
 
   // Transitions documented as legitimate elsewhere in this file/onboarding-procedures.md,
   // beyond the plain "next stage in STAGE_ORDER" case — an allowlist, not a pure
@@ -230,7 +249,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
 
   function stageTransitionWarning(fromStage: string, toStage: string): string | undefined {
     if (fromStage === toStage) return undefined; // same-stage "log contact" touch (flow #6) — always fine
-    if (TERMINAL_SIDE_STAGES.has(fromStage) || TERMINAL_SIDE_STAGES.has(toStage)) return undefined;
+    if (SIDE_STAGES.has(fromStage) || SIDE_STAGES.has(toStage)) return undefined;
     if (ALLOWED_EXTRA_TRANSITIONS.has(`${fromStage}->${toStage}`)) return undefined;
     const fromIdx = STAGE_ORDER.indexOf(fromStage);
     const toIdx = STAGE_ORDER.indexOf(toStage);
@@ -423,6 +442,54 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             city: args.city as string | undefined,
             country: args.country as string | undefined,
           });
+          return ok(JSON.stringify(data, null, 2));
+        } catch (e) {
+          return err(e instanceof Error ? e.message : String(e));
+        }
+      },
+    },
+
+    {
+      tool: {
+        name: 'onboarding_evaluate',
+        description: 'Preview what would happen if this chapter were switched into the onboarding pipeline right now — read-only, no side effects, safe to call anytime. Use `get_chapters`/`get_chapter` first to find the chapter\'s UUID. Returns `evaluation.stage` (the stage the API would assign, working backwards from what\'s already on file — may be `needs_attention` if it can\'t confidently place it), `evaluation.notes`, `evaluation.isRevival` (true if the chapter\'s current lead email differs from the pipeline\'s historical record — a lead-organizer change), and `evaluation.resetPipeline` (true if existing progress would be cleared). **Always call this before `onboarding_initiate` and check `isRevival` — if true, you must stop and get the admin\'s explicit confirmation before initiating, since it means real prior progress will be reset.**',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            chapter_id: { type: 'string', description: 'The chapter\'s UUID (from get_chapters/get_chapter — not the pipeline record id).' },
+          },
+          required: ['chapter_id'],
+          additionalProperties: false,
+        },
+      },
+      async handler(args) {
+        try {
+          const data = await apiPost('/agent/onboarding/evaluate', { chapterId: args.chapter_id as string });
+          return ok(JSON.stringify(data, null, 2));
+        } catch (e) {
+          return err(e instanceof Error ? e.message : String(e));
+        }
+      },
+    },
+
+    {
+      tool: {
+        name: 'onboarding_initiate',
+        description: 'Switch an existing chapter (currently managed manually, or previously inactive) into the onboarding pipeline. Works backwards from whatever is already on file to pick a starting stage — it is NOT always `referred`/`invited`; it can come back as `meeting_scheduled`, `nagging`, or `needs_attention`. Creates the pipeline record if none exists yet for this chapter. **Call `onboarding_evaluate` first and get explicit admin confirmation if `evaluation.isRevival` is true** — this call is what actually resets existing progress in that case, not just previews it. Returns `pipeline` (the full pipeline record, including its own `id` — use that for every downstream call, e.g. onboarding_advance/onboarding_render_template) and `profile_state`.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            chapter_id: { type: 'string', description: 'The chapter\'s UUID (from get_chapters/get_chapter, or from a prior onboarding_evaluate call on the same chapter).' },
+          },
+          required: ['chapter_id'],
+          additionalProperties: false,
+        },
+      },
+      async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
+        try {
+          const data = await apiPost('/agent/onboarding/initiate', { chapterId: args.chapter_id as string });
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
