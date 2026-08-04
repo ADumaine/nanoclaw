@@ -19,6 +19,8 @@ export interface RunnerConfig {
   model?: string;
   effort?: string;
   disabledModules: string[];
+  /** 'all' (default) means the provider's own native allowlist applies unmodified. */
+  allowedTools: string[] | 'all';
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -49,6 +51,7 @@ export function loadConfig(): RunnerConfig {
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
     disabledModules: Array.isArray(raw.disabledModules) ? (raw.disabledModules as string[]) : [],
+    allowedTools: Array.isArray(raw.allowedTools) ? (raw.allowedTools as string[]) : 'all',
   };
 
   return _config;

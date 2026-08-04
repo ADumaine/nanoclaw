@@ -69,11 +69,26 @@ const TOOL_ALLOWLIST = [
 // describing them, never actual tool availability).
 const AGENTS_MODULE_TOOLS = ['Task', 'TaskOutput', 'TaskStop', 'TeamCreate', 'TeamDelete'];
 
-/** TOOL_ALLOWLIST filtered by this container's disabled_modules (container.json). */
+// TOOL_ALLOWLIST filtered by this container's disabled_modules and
+// allowedTools (container.json). allowedTools was previously write-only —
+// container_configs.allowed_tools was materialized into container.json but
+// nothing here ever read it back, so a group configured with a restricted
+// list (e.g. no Bash/Write/Edit for a member-facing agent) silently still
+// got the full native TOOL_ALLOWLIST. MCP server prefixes (including the
+// always-present in-process "nanoclaw" server — send_message, schedule_task,
+// etc.) are added separately at the call site and are NOT restricted by
+// allowedTools; without those the agent couldn't function at all.
 function effectiveToolAllowlist(): string[] {
-  const disabled = loadConfig().disabledModules;
-  if (!disabled.includes('agents')) return TOOL_ALLOWLIST;
-  return TOOL_ALLOWLIST.filter((t) => !AGENTS_MODULE_TOOLS.includes(t));
+  const config = loadConfig();
+  let tools = TOOL_ALLOWLIST;
+  if (config.disabledModules.includes('agents')) {
+    tools = tools.filter((t) => !AGENTS_MODULE_TOOLS.includes(t));
+  }
+  if (config.allowedTools !== 'all') {
+    const allowed = new Set(config.allowedTools);
+    tools = tools.filter((t) => allowed.has(t));
+  }
+  return tools;
 }
 
 // MCP server names are sanitized by the SDK when forming tool prefixes:
