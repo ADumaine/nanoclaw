@@ -246,6 +246,24 @@ Key format: `WEBAPP_CALLBACK_URL_<app_id>` — exact match, case-sensitive. The 
 
 Each environment can point to a different agent group if you want isolated agent workspaces, or share one agent group if you want dev and prod to share memory and configuration.
 
+## Reply destination (required for the agent to respond at all)
+
+Wiring a messaging group to an agent group (Step 6 of `/setup-webapp`) lets the agent *receive* messages, but it can't *reply* until it also has an `agent_destinations` row naming that channel. Without one, every `<message to="...">` the agent sends for this channel is silently dropped — no error surfaces anywhere, `POST /message` still returns `202`, and it looks from the outside like the agent is either not responding or hanging.
+
+`/setup-webapp` (as of the version installed after 2026-08-03) creates this automatically in its Step 7. If you're troubleshooting an older setup, or wired a messaging group + agent group manually rather than through the skill, check for it directly:
+
+```bash
+ncl destinations list --agent-group-id <agent-group-id>
+```
+
+If nothing points at your messaging group's ID, add it:
+
+```bash
+ncl destinations add --agent-group-id <agent-group-id> --local-name <name> --target-type channel --target-id <messaging-group-id>
+```
+
+Takes effect immediately on already-running sessions — no restart needed.
+
 ## See also
 
 - [docs/isolation-model.md](isolation-model.md) — the three session isolation levels in full

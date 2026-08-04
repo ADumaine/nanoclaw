@@ -113,7 +113,29 @@ ncl wirings create \
 
 If a wiring between this messaging group and agent group already exists, skip this step.
 
-## Step 7 — Per-app callback override (optional)
+## Step 7 — Register the reply destination
+
+**Without this step the agent can receive messages from this webapp but can never reply to them.** A `<message to="...">` send with no matching destination is silently dropped (logged host-side, no error surfaced anywhere the admin would see) — and the smoke test in Step 10 won't catch it, since it only confirms `POST /message` was accepted, not that a reply ever arrives. Wiring created via `/manage-channels` gets this automatically (`createMessagingGroupAgent` creates the companion `agent_destinations` row); the direct `ncl wirings create` used in Step 6 above does not.
+
+Check whether `AG_ID` already has a destination pointing at this messaging group (e.g. re-running this skill for an `app_id` on an agent group that already has one, or the agent group was also wired via `/manage-channels`):
+
+```bash
+ncl destinations list --agent-group-id "${AG_ID}"
+```
+
+If nothing points at `MG_ID` yet, ask (free-form): "What name should the agent use to address this destination? (lowercase, dash-separated — e.g. `webapp`, or something more specific like `admin_panel` if this agent group will have multiple channels)" Record as `DEST_NAME`. Then:
+
+```bash
+ncl destinations add \
+  --agent-group-id "${AG_ID}" \
+  --local-name "${DEST_NAME}" \
+  --target-type channel \
+  --target-id "${MG_ID}"
+```
+
+This takes effect immediately on any already-running session for that agent group — no restart needed for this step specifically.
+
+## Step 8 — Per-app callback override (optional)
 
 If this `app_id` needs a different callback URL than the default `WEBAPP_CALLBACK_URL` (e.g. a dev environment pointing at `localhost`):
 
@@ -126,7 +148,7 @@ echo "WEBAPP_CALLBACK_URL_${APP_ID}=<url>" >> .env
 mkdir -p data/env && cp .env data/env/env
 ```
 
-## Step 8 — Restart NanoClaw
+## Step 9 — Restart NanoClaw
 
 ```bash
 systemctl --user restart nanoclaw        # Linux
@@ -139,7 +161,7 @@ Wait a few seconds, then verify the adapter started:
 grep "Webapp channel adapter listening" logs/nanoclaw.log | tail -3
 ```
 
-## Step 9 — Smoke test
+## Step 10 — Smoke test
 
 Verify end-to-end:
 
@@ -159,7 +181,7 @@ curl -s -X POST http://127.0.0.1:${WEBAPP_PORT:-3099}/message \
   -d "{\"app_id\":\"${APP_ID}\",\"user_id\":\"test-user\",\"thread_id\":\"test-user\",\"message\":\"ping\"}"
 ```
 
-Expected response: `{"status":"accepted"}`. The agent reply will arrive at your callback URL asynchronously (allow ~60s for cold start on the first message).
+Expected response: `{"status":"accepted"}`. **This only confirms NanoClaw accepted the message — it does not confirm the agent can reply.** Check your callback endpoint (or its logs) for an actual reply arriving within ~60s (allow for cold start on the first message). If no reply ever arrives despite a `202`, re-check Step 7 — a missing destination fails exactly this way, silently, with nothing in the `202` response to indicate it.
 
 If the response is `404`, the messaging group registration didn't take — re-check step 5.
 If the response is `401`, the shared secret in the curl command doesn't match `.env`.
