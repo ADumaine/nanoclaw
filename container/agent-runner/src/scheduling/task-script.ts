@@ -20,10 +20,19 @@ export async function runScript(script: string, taskId: string): Promise<ScriptR
   const scriptPath = path.join('/tmp', `task-script-${taskId}.sh`);
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
+  // A script with its own shebang (e.g. `#!/usr/bin/env bun`) is executed
+  // directly so the OS honors it — forcing `bash <path>` unconditionally
+  // would treat the shebang as a harmless comment and then fail parsing
+  // whatever non-bash content follows it. Plain bash scripts (no shebang)
+  // keep the old explicit-bash invocation.
+  const hasShebang = script.startsWith('#!');
+  const command = hasShebang ? scriptPath : 'bash';
+  const args = hasShebang ? [] : [scriptPath];
+
   return new Promise((resolve) => {
     execFile(
-      'bash',
-      [scriptPath],
+      command,
+      args,
       { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: process.env },
       (error, stdout, stderr) => {
         try {
