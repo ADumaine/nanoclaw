@@ -17,15 +17,23 @@ function log(msg: string): void {
 }
 
 export async function runScript(script: string, taskId: string): Promise<ScriptResult | null> {
-  const scriptPath = path.join('/tmp', `task-script-${taskId}.sh`);
-  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
-
   // A script with its own shebang (e.g. `#!/usr/bin/env bun`) is executed
   // directly so the OS honors it — forcing `bash <path>` unconditionally
   // would treat the shebang as a harmless comment and then fail parsing
   // whatever non-bash content follows it. Plain bash scripts (no shebang)
   // keep the old explicit-bash invocation.
   const hasShebang = script.startsWith('#!');
+
+  // Bun/Node/Deno pick a parser by file extension, not by shebang — a
+  // `.sh`-named file is rejected as invalid syntax even with a
+  // `#!/usr/bin/env bun` shebang and genuinely valid TypeScript inside
+  // (confirmed by reproduction: identical content, `.sh` fails to parse,
+  // `.ts` runs correctly). Other shebang'd interpreters (bash, python, ...)
+  // don't care about extension at all, so `.sh` is a safe default for them.
+  const usesJsRuntime = hasShebang && /^#!.*\b(bun|node|deno)\b/.test(script);
+  const scriptPath = path.join('/tmp', `task-script-${taskId}.${usesJsRuntime ? 'ts' : 'sh'}`);
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+
   const command = hasShebang ? scriptPath : 'bash';
   const args = hasShebang ? [] : [scriptPath];
 

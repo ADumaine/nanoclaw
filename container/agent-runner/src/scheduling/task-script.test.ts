@@ -29,4 +29,25 @@ describe('runScript', () => {
     const result = await runScript(script, `test-${Date.now()}-error`);
     expect(result).toBeNull();
   });
+
+  it('runs a real bun-shebang TypeScript script — not just a plain command', async () => {
+    // Bun/Node/Deno pick a parser by file extension, not by shebang — this
+    // guards the second half of the bug: even once the interpreter was
+    // fixed to honor `#!/usr/bin/env bun`, a `.sh`-named file was still
+    // rejected as invalid syntax by Bun's own parser. Real TS syntax
+    // (a typed function, a template literal) is used deliberately, not a
+    // bare `console.log`, since a `.js`-parseable subset wouldn't have
+    // caught this.
+    const script = [
+      '#!/usr/bin/env bun',
+      'function build(n: number): { wakeAgent: boolean; data: number } {',
+      '  return { wakeAgent: true, data: n * 2 };',
+      '}',
+      'console.log(JSON.stringify(build(21)));',
+    ].join('\n');
+    const result = await runScript(script, `test-${Date.now()}-bun-ts`);
+    expect(result).not.toBeNull();
+    expect(result?.wakeAgent).toBe(true);
+    expect(result?.data).toBe(42);
+  });
 });
