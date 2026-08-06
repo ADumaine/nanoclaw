@@ -86,6 +86,8 @@
  *   onboarding_daily_summary        — aggregate + dispatch the daily admin activity summary
  *   onboarding_weekly_summary       — aggregate + dispatch the weekly Champions growth digest
  */
+import fs from 'fs';
+
 import { loadConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -311,6 +313,44 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       return undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  // Real incident, 2026-08-06: the agent called onboarding_daily_summary
+  // three times within 12 seconds during a single manual "run the daily
+  // sweep now" turn, each call a genuine independent send — three real
+  // digest emails to the admin list, not one retried attempt. The agent's
+  // own self-report undercounted this (claimed 2 calls; the actual sent
+  // emails proved 3), so this can't be relied on to self-police — same
+  // class of failure as every other "just tell it to do X once" instruction
+  // in this project's history (see onboarding-procedures.md's own framing
+  // of this exact lesson). A short cooldown, not a full "once per day" gate
+  // (which would block legitimate deliberate re-runs during testing/config,
+  // like the one that surfaced this), is what actually matches the failure:
+  // rapid accidental re-calls within one turn, not a genuine second run
+  // minutes or hours later.
+  const DAILY_SUMMARY_COOLDOWN_MS = 2 * 60 * 1000;
+  const DAILY_SUMMARY_MARKER_PATH = '/workspace/agent/.onboarding-daily-summary-last-sent';
+
+  function checkDailySummaryCooldown(): string | undefined {
+    try {
+      const lastMs = Number(fs.readFileSync(DAILY_SUMMARY_MARKER_PATH, 'utf8').trim());
+      const elapsedMs = Date.now() - lastMs;
+      if (!Number.isNaN(lastMs) && elapsedMs < DAILY_SUMMARY_COOLDOWN_MS) {
+        const secondsAgo = Math.round(elapsedMs / 1000);
+        return `onboarding_daily_summary already dispatched ${secondsAgo}s ago — refusing to send again within ${DAILY_SUMMARY_COOLDOWN_MS / 1000}s to prevent an accidental duplicate email. If a genuine second run is actually needed, wait a moment and try again.`;
+      }
+    } catch {
+      /* no marker yet, or unreadable — proceed */
+    }
+    return undefined;
+  }
+
+  function markDailySummarySent(): void {
+    try {
+      fs.writeFileSync(DAILY_SUMMARY_MARKER_PATH, String(Date.now()));
+    } catch {
+      /* best-effort — a failed write here shouldn't fail the send itself */
     }
   }
 
@@ -800,8 +840,11 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       async handler() {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
+        const cooldownBlocked = checkDailySummaryCooldown();
+        if (cooldownBlocked) return err(cooldownBlocked);
         try {
           const data = await apiGet('/agent/onboarding/daily-summary');
+          markDailySummarySent();
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
