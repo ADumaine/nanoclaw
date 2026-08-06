@@ -65,6 +65,23 @@ Skip the upstream template's example skills (`hello-world.*`, `skill-store-round
 
 Set `SKILLSCRIPT_RPC_URL` in NanoClaw's `.env`, e.g. `http://<host>:7878/rpc`.
 
+### If `CM_API_BASE_URL` uses `localhost`, skillscript needs `host.docker.internal` resolution too — real incident, 2026-08-06
+
+Every skill that hits the CM API (`onboarding-render-email`, `onboarding-advance`, `onboarding-go-live`, `onboarding-daily-sweep`, `onboarding-notify-admins`) does so via a plain `curl ${BASE_URL}/...` running **inside skillscript's own container**. `BASE_URL` is whatever `onboarding.ts` reads from its own `CM_API_BASE_URL` environment variable — but if that variable is set to `http://localhost:<port>` in NanoClaw's `.env`, `src/container-runner.ts`'s `rewriteLocalhostUrl()` rewrites it to `http://host.docker.internal:<port>` before injecting it into the **agent** container (this is why the agent's own direct API calls — `onboarding_list`, `onboarding_get`, etc. — work fine regardless). `onboarding.ts` then forwards that already-rewritten value as the `BASE_URL` skill input, unchanged — and skillscript's container, a completely separate deployment, has no reason to resolve `host.docker.internal` unless its own `docker-compose.yml` says so.
+
+**Symptom**: any skillscript-backed onboarding tool fails with `curl exited with code 6` — DNS resolution failure, not a connection or auth error. First seen at cm-onboarding's first-ever unattended `onboarding-daily-sweep` firing.
+
+**Why this doesn't show up on dev**: dev's `CM_API_BASE_URL` is a real LAN address (`http://192.168.1.50:8888`), not `localhost` — `rewriteLocalhostUrl()` only touches `localhost`/`127.0.0.1` hostnames, so dev's value passes through untouched and is directly reachable from any container on the network, skillscript's included. This bug is structurally invisible in an environment that doesn't use `localhost` for `CM_API_BASE_URL` — don't assume "it works on dev" means anything here.
+
+**Fix**, in skillscript-cm's own `docker-compose.yml`:
+```yaml
+services:
+  dashboard:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+Apply with `docker compose up -d dashboard`. Verify directly: `docker exec <dashboard-container> curl -v http://host.docker.internal:<port>/agent/onboarding/settings` — expect a real HTTP response (even a `401` with no auth header proves the network path works; `curl: (6) Could not resolve host` means this fix hasn't been applied yet).
+
 ## Gmail credentials for the *agent container* — separate from skillscript's own connector below
 
 Gmail auth for the onboarding agent (the container-side `mcp__gmail__*` tools) goes through OneCLI's own vault (`mondai@cryptomondays.io`), independent of skillscript. See `.claude/skills/add-gmail-tool/SKILL.md` for the full procedure (stub credential files, mount allowlist, secret-mode check). One thing not in that skill: if connecting Gmail via OneCLI's web UI fails, OneCLI itself may need an explicit `APP_URL` set in **its own** `.env` (separate from NanoClaw's), with its `docker-compose.yml` changed to use `APP_URL: ${APP_URL}` instead of deriving the URL from `ONECLI_BIND_HOST` — OAuth redirect URIs need an exact, externally-reachable URL, and a bind-host-derived value (often `0.0.0.0`, not reachable by a browser or Google's redirect) breaks the flow.

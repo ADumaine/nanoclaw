@@ -329,16 +329,15 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
   // like the one that surfaced this), is what actually matches the failure:
   // rapid accidental re-calls within one turn, not a genuine second run
   // minutes or hours later.
-  const DAILY_SUMMARY_COOLDOWN_MS = 2 * 60 * 1000;
-  const DAILY_SUMMARY_MARKER_PATH = '/workspace/agent/.onboarding-daily-summary-last-sent';
+  const SUMMARY_COOLDOWN_MS = 2 * 60 * 1000;
 
-  function checkDailySummaryCooldown(): string | undefined {
+  function checkSummaryCooldown(toolName: string, markerPath: string): string | undefined {
     try {
-      const lastMs = Number(fs.readFileSync(DAILY_SUMMARY_MARKER_PATH, 'utf8').trim());
+      const lastMs = Number(fs.readFileSync(markerPath, 'utf8').trim());
       const elapsedMs = Date.now() - lastMs;
-      if (!Number.isNaN(lastMs) && elapsedMs < DAILY_SUMMARY_COOLDOWN_MS) {
+      if (!Number.isNaN(lastMs) && elapsedMs < SUMMARY_COOLDOWN_MS) {
         const secondsAgo = Math.round(elapsedMs / 1000);
-        return `onboarding_daily_summary already dispatched ${secondsAgo}s ago — refusing to send again within ${DAILY_SUMMARY_COOLDOWN_MS / 1000}s to prevent an accidental duplicate email. If a genuine second run is actually needed, wait a moment and try again.`;
+        return `${toolName} already dispatched ${secondsAgo}s ago — refusing to send again within ${SUMMARY_COOLDOWN_MS / 1000}s to prevent an accidental duplicate email. If a genuine second run is actually needed, wait a moment and try again.`;
       }
     } catch {
       /* no marker yet, or unreadable — proceed */
@@ -346,13 +345,16 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     return undefined;
   }
 
-  function markDailySummarySent(): void {
+  function markSummarySent(markerPath: string): void {
     try {
-      fs.writeFileSync(DAILY_SUMMARY_MARKER_PATH, String(Date.now()));
+      fs.writeFileSync(markerPath, String(Date.now()));
     } catch {
       /* best-effort — a failed write here shouldn't fail the send itself */
     }
   }
+
+  const DAILY_SUMMARY_MARKER_PATH = '/workspace/agent/.onboarding-daily-summary-last-sent';
+  const WEEKLY_SUMMARY_MARKER_PATH = '/workspace/agent/.onboarding-weekly-summary-last-sent';
 
   // Calls skillscript-runtime's execute_skill over its RPC endpoint and
   // returns the skill's final_vars. Throws on transport errors, JSON-RPC
@@ -840,11 +842,11 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       async handler() {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
-        const cooldownBlocked = checkDailySummaryCooldown();
+        const cooldownBlocked = checkSummaryCooldown('onboarding_daily_summary', DAILY_SUMMARY_MARKER_PATH);
         if (cooldownBlocked) return err(cooldownBlocked);
         try {
           const data = await apiGet('/agent/onboarding/daily-summary');
-          markDailySummarySent();
+          markSummarySent(DAILY_SUMMARY_MARKER_PATH);
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
@@ -861,8 +863,11 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
       async handler() {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
+        const cooldownBlocked = checkSummaryCooldown('onboarding_weekly_summary', WEEKLY_SUMMARY_MARKER_PATH);
+        if (cooldownBlocked) return err(cooldownBlocked);
         try {
           const data = await apiGet('/agent/onboarding/weekly-summary');
+          markSummarySent(WEEKLY_SUMMARY_MARKER_PATH);
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
