@@ -6,6 +6,10 @@ allowed-tools: Bash(agent-browser:*)
 
 # Browser Automation with agent-browser
 
+## How to actually run these commands
+
+Loading this skill (calling `Skill` with `skill: "agent-browser"`) only puts these instructions in front of you — it does not run anything, no matter what you pass as `args`. To actually browse, call the **`Bash`** tool directly, once per command, with the real `agent-browser` command line as the `command` argument (e.g. `Bash({command: "agent-browser open https://example.com"})`). Calling `Skill` again with the command as `args` does nothing except reload these same instructions — if a command didn't seem to run, the fix is to call `Bash`, not to call `Skill` again.
+
 ## Quick start
 
 ```bash
