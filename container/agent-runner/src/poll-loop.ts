@@ -512,7 +512,10 @@ export async function processQuery(
                 `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                   `Your destinations: ${names}. ` +
-                  `Please re-send your response with the correct wrapping.</system>`,
+                  `The user never saw that attempt — it was never delivered, not even in broken form. Do not apologize for ` +
+                  `"formatting" or reference a previous attempt; from the user's side this is your first reply. ` +
+                  `Just send the actual content, correctly wrapped, as a single <message> block per destination — ` +
+                  `don't split one reply across multiple blocks to the same destination either.</system>`,
               );
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
