@@ -438,6 +438,65 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+describe('token usage propagation', () => {
+  function seedChannelDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  it('carries tokensUsed/model from the result event into an error-result delivery', async () => {
+    const { query } = makeResultQuery({
+      type: 'result',
+      text: 'Spending limit reached.',
+      isError: true,
+      tokensUsed: 1234,
+      model: 'claude-sonnet-5',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    const content = JSON.parse(out[0].content);
+    expect(content.tokens_used).toBe(1234);
+    expect(content.model).toBe('claude-sonnet-5');
+  });
+
+  it('carries tokensUsed/model from the result event into a <message to="..."> dispatch', async () => {
+    seedChannelDestination('discord-main', 'discord', 'chan-1');
+    const { query } = makeResultQuery({
+      type: 'result',
+      text: '<message to="discord-main">Hello there</message>',
+      tokensUsed: 567,
+      model: 'claude-sonnet-5',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    const content = JSON.parse(out[0].content);
+    expect(content.text).toBe('Hello there');
+    expect(content.tokens_used).toBe(567);
+    expect(content.model).toBe('claude-sonnet-5');
+  });
+
+  it('omits tokens_used/model entirely when the result event does not carry them', async () => {
+    const { query } = makeResultQuery({ type: 'result', text: 'Spending limit reached.', isError: true });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    const content = JSON.parse(out[0].content);
+    expect(content.tokens_used).toBeUndefined();
+    expect(content.model).toBeUndefined();
+  });
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);

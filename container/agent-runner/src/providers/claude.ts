@@ -474,9 +474,26 @@ export class ClaudeProvider implements AgentProvider {
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Surface either so the poll-loop can deliver a
           // billing/quota notice to the user rather than dropping the turn.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            usage?: { input_tokens?: number; output_tokens?: number };
+            modelUsage?: Record<string, unknown>;
+          };
           const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
-          yield { type: 'result', text, isError: m.is_error === true };
+          // Every SDKResultMessage (success or error subtype) carries `usage`
+          // and `modelUsage` per the SDK's own types — this was previously
+          // discarded by this cast, which only ever destructured result/
+          // is_error/errors. tokensUsed is input+output for this turn;
+          // modelUsage is keyed by model name, so a single-model turn (the
+          // common case) yields exactly one key to report.
+          const tokensUsed =
+            typeof m.usage?.input_tokens === 'number' && typeof m.usage?.output_tokens === 'number'
+              ? m.usage.input_tokens + m.usage.output_tokens
+              : undefined;
+          const model = m.modelUsage ? Object.keys(m.modelUsage)[0] : undefined;
+          yield { type: 'result', text, isError: m.is_error === true, tokensUsed, model };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
