@@ -183,31 +183,56 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 }
 
 /**
- * PreToolUse hook: record the current tool + its declared timeout so the host
- * sweep can widen its stuck tolerance while Bash is running a long-declared
- * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
- * block the call here instead of letting the agent hang.
+ * PreToolUse hook: true default-deny allowlist enforcement, not a denylist.
+ *
+ * `tools`/`allowedTools` (set in query() below) only govern the SDK's own
+ * "built-in tools" category. The Claude Code CLI harness this SDK drives
+ * exposes a separate category of product-level tools regardless — Cron*,
+ * DesignSync, PushNotification, RemoteTrigger, Monitor, EndConversation, the
+ * Agent/Task* subagent-and-task-tracking system, etc. Confirmed live
+ * 2026-08-09: community successfully called DesignSync despite it never
+ * appearing in TOOL_ALLOWLIST, any group's allowed_tools config, or even
+ * SDK_DISALLOWED_TOOLS. A denylist of harness tool names is structurally the
+ * wrong defense against this category — it only ever blocks names someone
+ * has already discovered and enumerated, and silently admits anything the
+ * SDK or Claude Code product adds later (which happened here: TaskCreate/
+ * Agent aren't the older Task/TaskOutput/TaskStop names SDK_DISALLOWED_TOOLS
+ * and AGENTS_MODULE_TOOLS were written against).
+ *
+ * This hook instead blocks anything NOT in the group's own allowlist (native
+ * tools) or a registered MCP server's namespace — unknown future tools are
+ * blocked by default, not admitted by default. SDK_DISALLOWED_TOOLS stays as
+ * an earlier, cheaper rejection layer for the specific names already known;
+ * this hook is the actual guarantee, since it doesn't need to know a tool's
+ * name in advance to block it.
  */
-const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
-  const toolName = i.tool_name ?? '';
-  if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
-    return {
-      decision: 'block',
-      stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
-    } as unknown as ReturnType<HookCallback>;
-  }
-  // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
-  // tool: no declared timeout.
-  const declaredTimeoutMs =
-    toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
-  try {
-    setContainerToolInFlight(toolName, declaredTimeoutMs);
-  } catch (err) {
-    log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { continue: true };
-};
+function makePreToolUseHook(mcpServers: Record<string, McpServerConfig>): HookCallback {
+  const allowedMcpPrefixes = Object.keys(mcpServers).map(
+    (name) => `mcp__${name.replace(/[^a-zA-Z0-9_-]/g, '_')}__`,
+  );
+  return async (input) => {
+    const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+    const toolName = i.tool_name ?? '';
+    const isAllowedBuiltin = effectiveToolAllowlist().includes(toolName);
+    const isAllowedMcp = allowedMcpPrefixes.some((prefix) => toolName.startsWith(prefix));
+    if (!isAllowedBuiltin && !isAllowedMcp) {
+      return {
+        decision: 'block',
+        stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
+    // tool: no declared timeout.
+    const declaredTimeoutMs =
+      toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+    try {
+      setContainerToolInFlight(toolName, declaredTimeoutMs);
+    } catch (err) {
+      log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { continue: true };
+  };
+}
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
 const postToolUseHook: HookCallback = async () => {
@@ -465,7 +490,7 @@ export class ClaudeProvider implements AgentProvider {
         settingSources: ['project', 'user', 'local'],
         mcpServers: this.mcpServers,
         hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PreToolUse: [{ hooks: [makePreToolUseHook(this.mcpServers)] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
