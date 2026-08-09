@@ -335,6 +335,7 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  let fabricationNudged = false;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -418,6 +419,7 @@ export async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
+        fabricationNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
         markCompleted(keptIds);
@@ -482,45 +484,69 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing, event.tokensUsed, event.model);
-          if (sent === 0 && event.isError === true) {
-            // Non-retryable error turn (e.g. a 403 billing_error) with no
-            // <message> envelope: deliver the notice instead of dropping it as
-            // scratchpad, and skip the re-wrap nudge — it would just re-hammer
-            // the failing gateway turn after turn.
-            deliverErrorResult(event.text, routing, event.tokensUsed, event.model);
+          const willRetryFabrication = containsFabricatedPlaceholderLink(event.text) && !fabricationNudged;
+          if (willRetryFabrication) {
+            // Caught before dispatch entirely — nothing gets sent this pass,
+            // same as the unwrapped-message case never being sent. Capped at
+            // one retry per turn (fabricationNudged) so a model that keeps
+            // doing this doesn't loop forever; the second occurrence in the
+            // same turn is allowed through rather than silently dropped.
+            fabricationNudged = true;
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: 'error',
+              status: 'undelivered',
             });
-            archivePrompts.shift();
+            query.push(
+              `<system>Your last response was not delivered — it cited "https://example.com" (or a similar ` +
+                `example.org/example.net/example.edu placeholder) as a source. That domain is reserved for ` +
+                `documentation and can never be a real citation; including it as a "source" is a fabrication, not ` +
+                `a formatting issue. The user never saw that attempt. Resend your answer: if you have no real ` +
+                `search results to cite, say so plainly instead of including a Sources section at all — never ` +
+                `include a Sources heading unless every link under it actually came from a real tool result this turn.</system>`,
+            );
           } else {
-            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
-            notifyExchangeComplete(onExchangeComplete, {
-              prompt: archivePrompts[0] ?? initialPrompt,
-              result: event.text,
-              continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped ? 'undelivered' : 'completed',
-            });
-            if (willRetryWrapping) {
-              unwrappedNudged = true;
-              const destinations = getAllDestinations();
-              const names = destinations.map((d) => d.name).join(', ');
-              query.push(
-                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                  `Your destinations: ${names}. ` +
-                  `The user never saw that attempt — it was never delivered, not even in broken form. Do not apologize for ` +
-                  `"formatting" or reference a previous attempt; from the user's side this is your first reply. ` +
-                  `Just send the actual content, correctly wrapped, as a single <message> block per destination — ` +
-                  `don't split one reply across multiple blocks to the same destination either.</system>`,
-              );
+            const { sent, hasUnwrapped } = dispatchResultText(event.text, routing, event.tokensUsed, event.model);
+            if (sent === 0 && event.isError === true) {
+              // Non-retryable error turn (e.g. a 403 billing_error) with no
+              // <message> envelope: deliver the notice instead of dropping it as
+              // scratchpad, and skip the re-wrap nudge — it would just re-hammer
+              // the failing gateway turn after turn.
+              deliverErrorResult(event.text, routing, event.tokensUsed, event.model);
+              notifyExchangeComplete(onExchangeComplete, {
+                prompt: archivePrompts[0] ?? initialPrompt,
+                result: event.text,
+                continuation: queryContinuation ?? initialContinuation,
+                status: 'error',
+              });
+              archivePrompts.shift();
+            } else {
+              const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+              notifyExchangeComplete(onExchangeComplete, {
+                prompt: archivePrompts[0] ?? initialPrompt,
+                result: event.text,
+                continuation: queryContinuation ?? initialContinuation,
+                status: hasUnwrapped ? 'undelivered' : 'completed',
+              });
+              if (willRetryWrapping) {
+                unwrappedNudged = true;
+                const destinations = getAllDestinations();
+                const names = destinations.map((d) => d.name).join(', ');
+                query.push(
+                  `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                    `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                    `Your destinations: ${names}. ` +
+                    `The user never saw that attempt — it was never delivered, not even in broken form. Do not apologize for ` +
+                    `"formatting" or reference a previous attempt; from the user's side this is your first reply. ` +
+                    `Just send the actual content, correctly wrapped, as a single <message> block per destination — ` +
+                    `don't split one reply across multiple blocks to the same destination either.</system>`,
+                );
+              }
+              // The wrapping-retry result answers the SAME user prompt — keep it
+              // queued so the retry archives against it, not the nudge text.
+              if (!willRetryWrapping) archivePrompts.shift();
             }
-            // The wrapping-retry result answers the SAME user prompt — keep it
-            // queued so the retry archives against it, not the nudge text.
-            if (!willRetryWrapping) archivePrompts.shift();
           }
         } else {
           archivePrompts.shift();
@@ -597,6 +623,22 @@ function deliverErrorResult(text: string, routing: RoutingContext, tokensUsed?: 
       ...(model !== undefined ? { model } : {}),
     }),
   });
+}
+
+// RFC 2606 reserves example.com/.net/.org/.edu (and subdomains of them) for
+// documentation/placeholder use — no real citation can ever legitimately
+// point here. A markdown link to one of these is unambiguous evidence of a
+// fabricated source, not a judgment call the way general hallucination
+// detection would be. Real incident, 2026-08-09: community cited
+// "[Web search result: ...](https://example.com)" as a "source" after a
+// WebSearch came back empty — prose instructions telling the model not to
+// fabricate sources had already been tried and didn't hold here, so this is
+// a deterministic backstop for the one sub-case that's actually detectable
+// with certainty, not a replacement for those instructions.
+const FABRICATED_PLACEHOLDER_LINK_RE = /]\(\s*https?:\/\/(?:[\w-]+\.)*example\.(com|net|org|edu)\b/i;
+
+export function containsFabricatedPlaceholderLink(text: string): boolean {
+  return FABRICATED_PLACEHOLDER_LINK_RE.test(text);
 }
 
 /**

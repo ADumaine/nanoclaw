@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { containsFabricatedPlaceholderLink, isCorruptionError, processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -220,7 +220,13 @@ describe('origin metadata (from= attribute)', () => {
       .run(name, name, channelType, platformId);
   }
 
-  function insertWithRouting(id: string, kind: string, content: object, channelType: string | null, platformId: string | null): void {
+  function insertWithRouting(
+    id: string,
+    kind: string,
+    content: object,
+    channelType: string | null,
+    platformId: string | null,
+  ): void {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -496,6 +502,72 @@ describe('token usage propagation', () => {
     expect(content.model).toBeUndefined();
   });
 });
+
+describe('containsFabricatedPlaceholderLink', () => {
+  it('flags a markdown link to example.com', () => {
+    expect(containsFabricatedPlaceholderLink('Sources:\n- [Web search result](https://example.com)')).toBe(true);
+  });
+
+  it('flags example.org, example.net, example.edu, and subdomains, case-insensitively', () => {
+    expect(containsFabricatedPlaceholderLink('[x](https://example.org)')).toBe(true);
+    expect(containsFabricatedPlaceholderLink('[x](http://example.net/path)')).toBe(true);
+    expect(containsFabricatedPlaceholderLink('[x](https://sub.example.edu)')).toBe(true);
+    expect(containsFabricatedPlaceholderLink('[x](https://WWW.EXAMPLE.COM)')).toBe(true);
+  });
+
+  it('does not flag real domains, including ones containing "example" as a substring', () => {
+    expect(containsFabricatedPlaceholderLink('[Coindesk](https://coindesk.com/article)')).toBe(false);
+    expect(containsFabricatedPlaceholderLink('[x](https://notexample.com)')).toBe(false);
+    expect(containsFabricatedPlaceholderLink('[x](https://example.company.com)')).toBe(false);
+  });
+
+  it('does not flag plain text mentioning example.com without a markdown link', () => {
+    expect(containsFabricatedPlaceholderLink('example.com is the standard placeholder domain')).toBe(false);
+  });
+});
+
+describe('fabricated placeholder-link result: blocked before dispatch', () => {
+  it('does not deliver a result containing an example.com "source" link, and nudges instead', async () => {
+    const text =
+      '<message to="cryptomondays-dev">Here you go.\n\nSources:\n- [Web search result](https://example.com)</message>';
+    const { query, pushes } = makeResultQuery({ type: 'result', text });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('example.com');
+    expect(pushes[0]).toContain('fabrication');
+  });
+
+  it('delivers normally when the same text has no placeholder link', async () => {
+    const text =
+      '<message to="cryptomondays-dev">Here you go.\n\nSources:\n- [Coindesk](https://coindesk.com/x)</message>';
+    const { query, pushes } = makeResultQuery({ type: 'result', text });
+
+    seedChannelDestinationForFabricationTest();
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(pushes).toHaveLength(0);
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toContain('Coindesk');
+  });
+});
+
+function seedChannelDestinationForFabricationTest(): void {
+  try {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run('cryptomondays-dev', 'cryptomondays-dev', ERR_ROUTING.channelType, ERR_ROUTING.platformId);
+  } catch {
+    /* already seeded by an earlier test in this file */
+  }
+}
 
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
