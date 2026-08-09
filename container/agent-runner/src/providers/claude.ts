@@ -434,6 +434,23 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
+        // `tools` is the SDK option that actually restricts which built-in
+        // tools exist at all — confirmed against the SDK's own type docs:
+        // "Specify the base set of available built-in tools... To restrict
+        // which tools are available, use the `tools` option instead [of
+        // allowedTools]." `allowedTools` only controls which tools skip a
+        // permission *prompt*; with permissionMode: 'bypassPermissions'
+        // below, there are no prompts to skip in the first place, so
+        // allowedTools alone was doing nothing to actually restrict
+        // anything — every native tool (Bash, Write, Edit, Task, Agent,
+        // etc.) was available to every agent group regardless of
+        // disabled_modules/allowed_tools config. Confirmed live 2026-08-09:
+        // community (allowed_tools has no Bash, disabled_modules includes
+        // "agents") successfully called Bash directly and spawned a real
+        // subagent via TaskCreate/Agent. MCP-server tools are unaffected —
+        // their availability is governed by `mcpServers` below, not `tools`,
+        // which only covers built-ins.
+        tools: effectiveToolAllowlist(),
         allowedTools: [
           ...effectiveToolAllowlist(),
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
