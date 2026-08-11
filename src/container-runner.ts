@@ -478,7 +478,7 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     : [];
 }
 
-function rewriteLocalhostUrl(value: string, target = 'host.docker.internal'): string {
+export function rewriteLocalhostUrl(value: string, target = 'host.docker.internal'): string {
   try {
     const u = new URL(value);
     if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
