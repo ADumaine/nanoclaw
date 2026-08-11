@@ -234,12 +234,62 @@ function makePreToolUseHook(mcpServers: Record<string, McpServerConfig>): HookCa
   };
 }
 
-/** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
-const postToolUseHook: HookCallback = async () => {
+// Durable, container-restart-surviving record of every real send attempt
+// through the Gmail MCP server. Exists because chat transcripts alone proved
+// unreliable for answering "did this actually send" after the fact — a model
+// can narrate success (or a render step can get mistaken for a send) with no
+// corresponding call ever reaching Gmail, and container stdout/tool-call
+// traces are gone the moment the container exits. This file is the ground
+// truth: one line per real `mcp__gmail__*` invocation, success or failure.
+const GMAIL_CALL_LOG_PATH = '/workspace/agent/.gmail-call-log.jsonl';
+
+function logGmailToolCall(entry: {
+  toolName: string;
+  toolInput: unknown;
+  ok: boolean;
+  detail: unknown;
+}): void {
+  try {
+    const input = entry.toolInput as Record<string, unknown> | undefined;
+    const line = {
+      time: new Date().toISOString(),
+      tool: entry.toolName,
+      ok: entry.ok,
+      to: input?.to ?? input?.recipient ?? undefined,
+      subject: input?.subject ?? undefined,
+      detail: entry.ok ? undefined : entry.detail,
+    };
+    fs.appendFileSync(GMAIL_CALL_LOG_PATH, `${JSON.stringify(line)}\n`);
+  } catch (err) {
+    log(`Failed to write Gmail call log: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Clear in-flight tool on PostToolUse; also logs real Gmail send attempts. */
+const postToolUseHook: HookCallback = async (input) => {
   try {
     clearContainerToolInFlight();
   } catch (err) {
     log(`PostToolUse: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const i = input as { tool_name?: string; tool_input?: unknown; tool_response?: unknown };
+  if (i.tool_name?.startsWith('mcp__gmail__')) {
+    const resp = i.tool_response as { isError?: boolean } | undefined;
+    logGmailToolCall({ toolName: i.tool_name, toolInput: i.tool_input, ok: !resp?.isError, detail: i.tool_response });
+  }
+  return { continue: true };
+};
+
+/** Same as postToolUseHook, but for the PostToolUseFailure path (tool threw). */
+const postToolUseFailureHook: HookCallback = async (input) => {
+  try {
+    clearContainerToolInFlight();
+  } catch (err) {
+    log(`PostToolUseFailure: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const i = input as { tool_name?: string; tool_input?: unknown; error?: string };
+  if (i.tool_name?.startsWith('mcp__gmail__')) {
+    logGmailToolCall({ toolName: i.tool_name, toolInput: i.tool_input, ok: false, detail: i.error });
   }
   return { continue: true };
 };
@@ -492,7 +542,7 @@ export class ClaudeProvider implements AgentProvider {
         hooks: {
           PreToolUse: [{ hooks: [makePreToolUseHook(this.mcpServers)] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PostToolUseFailure: [{ hooks: [postToolUseFailureHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },
