@@ -224,7 +224,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     'referred',
     'invited',
     'following_up',
-    'meeting_scheduled',
+    'meeting',
     'verified',
     'live_instructions',
     'nagging',
@@ -241,12 +241,12 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
   // Transitions documented as legitimate elsewhere in this file/onboarding-procedures.md,
   // beyond the plain "next stage in STAGE_ORDER" case — an allowlist, not a pure
   // sequence check, specifically because a naive sequence check would false-positive
-  // on real, common, already-documented flows: flow #2 allows invited -> meeting_scheduled
+  // on real, common, already-documented flows: flow #2 allows invited -> meeting
   // directly (a prospect can reply before any follow-up was ever sent), and flow #6's
   // daily sweep does same-stage "touches" (following_up->following_up, nagging->nagging)
   // just to log contact, which is handled separately below, not via this set.
   const ALLOWED_EXTRA_TRANSITIONS = new Set([
-    'invited->meeting_scheduled', // flow #2: reply arrives before any follow-up was sent
+    'invited->meeting', // flow #2: reply arrives before any follow-up was sent
   ]);
 
   function stageTransitionWarning(fromStage: string, toStage: string): string | undefined {
@@ -517,7 +517,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     {
       tool: {
         name: 'onboarding_initiate',
-        description: 'Switch an existing chapter (currently managed manually, or previously inactive) into the onboarding pipeline. Works backwards from whatever is already on file to pick a starting stage — it is NOT always `referred`/`invited`; it can come back as `meeting_scheduled`, `nagging`, or `needs_attention`. Creates the pipeline record if none exists yet for this chapter. **Call `onboarding_evaluate` first and get explicit admin confirmation if `evaluation.isRevival` is true** — this call is what actually resets existing progress in that case, not just previews it. Returns `pipeline` (the full pipeline record, including its own `id` — use that for every downstream call, e.g. onboarding_advance/onboarding_render_template) and `profile_state`.',
+        description: 'Switch an existing chapter (currently managed manually, or previously inactive) into the onboarding pipeline. Works backwards from whatever is already on file to pick a starting stage — it is NOT always `referred`/`invited`; it can come back as `meeting`, `nagging`, or `needs_attention`. Creates the pipeline record if none exists yet for this chapter. **Call `onboarding_evaluate` first and get explicit admin confirmation if `evaluation.isRevival` is true** — this call is what actually resets existing progress in that case, not just previews it. Returns `pipeline` (the full pipeline record, including its own `id` — use that for every downstream call, e.g. onboarding_advance/onboarding_render_template) and `profile_state`.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -592,19 +592,20 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     {
       tool: {
         name: 'onboarding_render_template',
-        description: 'Resolve an onboarding email template (subject + HTML body + recipient) for a prospect by email. The API resolves all chapter/prospect fields, the app URL, and the meeting link automatically from its own database — you do not need to (and should not) supply substitution variables. In non-production environments the recipient may be redirected to a test address — always send to the returned recipient, not the prospect email directly.',
+        description: 'Resolve an onboarding email template (subject + HTML body + recipient) for a specific pipeline record. The API resolves all chapter/prospect fields, the app URL, and the meeting link automatically from its own database — you do not need to (and should not) supply substitution variables. Always pass `pipeline_id` (the pipeline record UUID you already have from onboarding_get/create/evaluate/initiate) — a prospect email is not unique to one chapter (the same person can lead more than one chapter in the pipeline at once), so `email` alone cannot reliably select the right record, and the API needs the exact record to generate the correct `Ref:` tracking number in the email footer. In non-production environments the recipient may be redirected to a test address — always send to the returned recipient, not the prospect email directly.',
         inputSchema: {
           type: 'object',
           properties: {
+            pipeline_id: { type: 'string', description: 'The pipeline record UUID — required so the correct chapter/prospect (and its Ref: tracking number) is resolved when the same email leads more than one pipeline record concurrently.' },
             name: { type: 'string', description: 'Exact template database name — see the template reference table for the current list. Must match exactly, including punctuation.' },
-            email: { type: 'string', description: "The prospect's real email address (from the pipeline record) — identifies which record to resolve fields from, and is used server-side for the dev-environment redirect check." },
+            email: { type: 'string', description: "The prospect's real email address (from the pipeline record) — used server-side for the dev-environment redirect check, not for record lookup." },
             variables: {
               type: 'object',
               description: 'Optional. Only for deliberately overriding a specific field — omit entirely for a normal send, the API fills everything in on its own.',
               additionalProperties: true,
             },
           },
-          required: ['name', 'email'],
+          required: ['pipeline_id', 'name', 'email'],
           additionalProperties: false,
         },
       },
@@ -616,13 +617,18 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
           // a deliberate `variables` override still goes straight to the API.
           if (SKILLSCRIPT_RPC_URL && args.variables === undefined) {
             const vars = await executeSkill('onboarding-render-email', {
+              PIPELINE_ID: args.pipeline_id as string,
               TEMPLATE: args.name as string,
               EMAIL: args.email as string,
               BASE_URL: BASE_URL as string,
             });
             return ok(JSON.stringify({ subject: vars.SUBJECT, htmlBody: vars.HTML_BODY, recipient: vars.RECIPIENT }, null, 2));
           }
-          const body: Record<string, unknown> = { name: args.name as string, email: args.email as string };
+          const body: Record<string, unknown> = {
+            pipelineId: args.pipeline_id as string,
+            name: args.name as string,
+            email: args.email as string,
+          };
           if (args.variables !== undefined) body.variables = args.variables;
           const data = await apiPost('/agent/onboarding/render-template', body);
           return ok(JSON.stringify(data, null, 2));
