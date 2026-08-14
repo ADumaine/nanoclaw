@@ -340,8 +340,9 @@ if (!BASE_URL) {
             country: { type: 'string', description: 'Filter by country.' },
             status: {
               type: 'string',
-              enum: ['active', 'inactive', 'pending'],
-              description: 'Filter by chapter status (defaults to active).',
+              enum: ['active', 'inactive', 'pending', 'onboarding'],
+              description:
+                'Filter by chapter status. **Omitting this defaults to active-only server-side** — chapters currently mid-pipeline (status "onboarding") are invisible unless this is set explicitly.',
             },
           },
           additionalProperties: false,
