@@ -483,7 +483,10 @@ export function rewriteLocalhostUrl(value: string, target = 'host.docker.interna
     const u = new URL(value);
     if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
       u.hostname = target;
-      return u.toString();
+      // URL.toString() normalizes an empty path to "/", adding a trailing slash
+      // not present in the input. Preserve the original trailing-slash presence.
+      const result = u.toString();
+      return value.endsWith('/') ? result : result.replace(/\/$/, '');
     }
   } catch {
     /* not a URL, return as-is */
