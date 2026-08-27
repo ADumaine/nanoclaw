@@ -57,6 +57,17 @@ if (!BASE_URL) {
     return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
   }
 
+  // Same root-array-or-wrapped-object tolerance as the /luma/calendar-events
+  // handler below — the exact response shape for /chapters isn't pinned down
+  // anywhere in this codebase, so accept either.
+  function extractChapters(data: unknown): unknown[] {
+    if (Array.isArray(data)) return data;
+    const obj = data as Record<string, unknown> | null;
+    if (Array.isArray(obj?.chapters)) return obj.chapters as unknown[];
+    if (Array.isArray(obj?.data)) return obj.data as unknown[];
+    return [];
+  }
+
   async function apiFetch(path: string, params?: Record<string, string | number | undefined>, authId?: string): Promise<unknown> {
     const url = new URL(`${BASE_URL}${path}`);
     if (params) {
@@ -355,6 +366,24 @@ if (!BASE_URL) {
           if (args.country) params.country = args.country as string;
           if (args.status) params.status = args.status as string;
           const data = await apiFetch('/chapters', params);
+
+          // Omitting `status` defaults to active-only server-side (see this
+          // tool's own description). A specific name/country lookup with no
+          // explicit status should still find a chapter that's mid-pipeline
+          // ("onboarding") or otherwise inactive — e.g. an admin asking about
+          // a chapter from its own dashboard page, which is only reachable
+          // while it's in that exact state. Retrying here deterministically
+          // beats relying on every future turn to remember to pass `status`
+          // explicitly, which the enum-widening fix alone did not guarantee.
+          const isSpecificLookup = !args.status && (args.name || args.country);
+          if (isSpecificLookup && extractChapters(data).length === 0) {
+            for (const status of ['onboarding', 'pending', 'inactive']) {
+              const retryData = await apiFetch('/chapters', { ...params, status });
+              if (extractChapters(retryData).length > 0) {
+                return ok(JSON.stringify(retryData, null, 2));
+              }
+            }
+          }
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
