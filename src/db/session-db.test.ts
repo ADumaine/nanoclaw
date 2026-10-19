@@ -112,13 +112,28 @@ describe('hasFutureScheduledWork', () => {
     db.close();
   });
 
-  it('is false when the only pending row is already due', () => {
+  it('is false when the only pending row is an already-due chat message', () => {
     const db = freshDb();
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
        VALUES ('m-due', 2, 'chat', datetime('now'), 'pending', datetime('now', '-1 minute'), '{}')`,
     ).run();
     expect(hasFutureScheduledWork(db)).toBe(false);
+    db.close();
+  });
+
+  it('is true for a task row that is exactly/already due — real incident, 2026-09-28', () => {
+    // A recurring task's next occurrence and a one-shot reminder can land on
+    // or just past the same process_after timestamp the sweep scans at —
+    // still live scheduled work, just not yet converted to its next
+    // occurrence. A strict future-only check here let the TTL sweep tear
+    // down a session that still owned two active recurring series.
+    const db = freshDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, content)
+       VALUES ('m-due-task', 2, 'task', datetime('now'), 'pending', datetime('now', '-1 minute'), '*/5 * * * *', '{}')`,
+    ).run();
+    expect(hasFutureScheduledWork(db)).toBe(true);
     db.close();
   });
 

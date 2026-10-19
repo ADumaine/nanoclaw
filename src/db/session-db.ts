@@ -147,12 +147,26 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
- * True if this session has a pending message scheduled for the future —
- * either a recurring task's next occurrence or a one-shot reminder. TTL
- * sweep must not delete a session with scheduled work still ahead of it:
- * a recurring task can fire silently (wakeAgent:false) for days without
- * ever producing real chat activity, so last_active alone is not a safe
- * "is this session still in use" signal.
+ * True if this session has a pending scheduled message — either a recurring
+ * task's next occurrence or a one-shot reminder. TTL sweep must not delete a
+ * session with scheduled work still ahead of it: a recurring task can fire
+ * silently (wakeAgent:false) for days without ever producing real chat
+ * activity, so last_active alone is not a safe "is this session still in
+ * use" signal.
+ *
+ * `kind = 'task'` rows (recurring tasks and one-shot reminders, both written
+ * by schedule_task) don't require process_after to be strictly in the
+ * future — such a row can be exactly due (or briefly overdue, e.g. a
+ * 5-minute and a daily series landing on the same timestamp) at the moment
+ * the sweep scans, and it's still live scheduled work, just not yet
+ * converted to its next occurrence. Real incident, 2026-09-28: a strict `>`
+ * comparison raced the host sweep against two recurring series (reply-poll
+ * + daily-sweep) that happened to share a process_after timestamp, both
+ * momentarily "not in the future" at the exact sweep tick — the session was
+ * judged to have no scheduled work and was torn down, silently ending both
+ * series. Ordinary `chat`-kind rows (e.g. a backoff-retried delivery) still
+ * require strictly-future process_after — an already-due one is just stuck,
+ * not scheduled work, and shouldn't keep a session alive indefinitely.
  */
 export function hasFutureScheduledWork(db: Database.Database): boolean {
   const row = db
@@ -160,7 +174,7 @@ export function hasFutureScheduledWork(db: Database.Database): boolean {
       `SELECT 1 FROM messages_in
         WHERE status = 'pending'
           AND process_after IS NOT NULL
-          AND datetime(process_after) > datetime('now')
+          AND (kind = 'task' OR datetime(process_after) > datetime('now'))
         LIMIT 1`,
     )
     .get();
