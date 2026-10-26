@@ -106,8 +106,8 @@ if (BASE_URL) {
   }
 
   const AUTH_ID_PARAM = {
-    auth_id: { type: 'string', description: "Sender's auth_id from user_context. Always pass this for user-initiated requests so the API enforces the correct role." },
-    user_status: { type: 'string', description: "Sender's status from user_context ('active', 'pending', or 'anonymous'). Always pass for write operations — tool blocks non-active users immediately." },
+    auth_id: { type: 'string', description: "Sender's auth_id attribute on the message Always pass this for user-initiated requests so the API enforces the correct role." },
+    user_status: { type: 'string', description: "Sender's status attribute on the message ('active', 'pending', or 'anonymous'). Always pass for write operations — tool blocks non-active users immediately." },
   };
 
   const tools: McpToolDefinition[] = [
@@ -160,7 +160,7 @@ if (BASE_URL) {
     {
       tool: {
         name: 'create_opportunity',
-        description: 'Submit a new Earn opportunity. Check user_context.status BEFORE asking for details — pass user_status here and the tool will block ineligible users immediately. Requires title and description. Call list_opportunity_types first to get a type_id. If location_type is "onsite" or "hybrid", location is required.',
+        description: 'Submit a new Earn opportunity. Check the message status attribute BEFORE asking for details — pass user_status here and the tool will block ineligible users immediately. Requires title and description. Call list_opportunity_types first to get a type_id. If location_type is "onsite" or "hybrid", location is required.',
         inputSchema: {
           type: 'object',
           properties: {

@@ -90,6 +90,21 @@ function extractSenderId(msg: MessageInRow, content: any): string | null {
 }
 
 /**
+ * Raw (un-namespaced) sender identifier, for forwarding to an external API
+ * rather than for internal admin-id comparison. Unlike `extractSenderId`
+ * above, this deliberately does NOT prefix with channel_type — the webapp
+ * channel's upstream API server (see docs/mondai/community-bot-mention-
+ * filter-and-attribution.md) expects back exactly what it sent as
+ * `user_id`: either a bare Supabase auth_id (UUID) or a bare numeric
+ * Telegram id, never a "webapp:"-prefixed value. Prefixing it would make
+ * it match neither of the API server's two accepted shapes.
+ */
+export function extractRawSenderIdFromJson(contentJson: string): string | null {
+  const content = parseContent(contentJson);
+  return content?.senderId || content?.author?.userId || null;
+}
+
+/**
  * Routing context extracted from messages_in rows.
  * Copied to messages_out by default so responses go back to the sender.
  */
@@ -98,6 +113,7 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
+  senderId: string | null;
 }
 
 /**
@@ -111,6 +127,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
+    senderId: first ? extractRawSenderIdFromJson(first.content) : null,
   };
 }
 
@@ -177,8 +194,18 @@ function formatSingleChat(msg: MessageInRow): string {
   const attachmentsSuffix = formatAttachments(content.attachments);
 
   const fromAttr = originAttr(msg);
+  // user_context/roles arrive in the raw content JSON (used elsewhere for
+  // routing/sender-id extraction) but were never rendered into the text the
+  // model actually reads — every tool and CLAUDE.md instruction that says
+  // "pass the sender's auth_id from user_context" had no real value to read,
+  // only the literal field-path string, which is why the model echoed
+  // "<user_context.auth_id>" back verbatim instead of a real id. Surfacing
+  // these as attributes (same pattern as `sender`) gives it an actual value.
+  const authIdAttr = content.user_context?.auth_id ? ` auth_id="${escapeXml(String(content.user_context.auth_id))}"` : '';
+  const statusAttr = content.user_context?.status ? ` status="${escapeXml(String(content.user_context.status))}"` : '';
+  const rolesAttr = Array.isArray(content.roles) && content.roles.length > 0 ? ` roles="${escapeXml(content.roles.join(','))}"` : '';
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${authIdAttr}${statusAttr}${rolesAttr}${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**
