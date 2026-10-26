@@ -130,11 +130,14 @@ NanoClaw POSTs agent replies to `WEBAPP_CALLBACK_URL`. Your API server must impl
   "source": "agent",
   "timestamp": "2025-01-01T12:00:00.000Z",
   "tokens_used": 1234,
-  "model": "claude-sonnet-4-6"
+  "model": "claude-sonnet-4-6",
+  "user_id": "123456789"
 }
 ```
 
 > **Note:** `app_id` in the callback is the full NanoClaw platform ID — `webapp:<app_id>`, not just `<app_id>`. Your callback handler should strip the `webapp:` prefix if you need the bare `app_id`.
+
+> **`user_id`** (optional, present only when the originating inbound message carried one): echoes back exactly whatever `user_id` your server sent on the way in (see the inbound `POST /message` body above) — a bare Supabase `auth_id` UUID or a bare platform id (e.g. a numeric Telegram id), never namespaced with a channel prefix. Lets a shared/group thread's token usage attribute to the actual sender of the turn rather than the thread as a whole. Absent when the inbound message never carried a `user_id` in the first place.
 
 **Typing indicator payload** (best-effort, may be absent or rejected):
 

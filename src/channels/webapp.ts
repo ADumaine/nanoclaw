@@ -314,6 +314,12 @@ registerChannelAdapter(CHANNEL_TYPE, {
           const contentText: string = typeof raw?.text === 'string' ? raw.text : JSON.stringify(message.content);
           const tokensUsed = typeof raw?.tokens_used === 'number' ? raw.tokens_used : undefined;
           const model = typeof raw?.model === 'string' ? raw.model : undefined;
+          // Per-message sender (auth_id UUID or raw platform id, as echoed
+          // back from the same `user_id` the API server sent us on the way
+          // in — see docs/mondai/community-bot-mention-filter-and-attribution.md).
+          // Lets the API server attribute token_usage to the actual sender
+          // in a shared group thread instead of the thread as a whole.
+          const userId = typeof raw?.user_id === 'string' ? raw.user_id : undefined;
           const appId = platformId.startsWith(`${CHANNEL_TYPE}:`)
             ? platformId.slice(CHANNEL_TYPE.length + 1)
             : platformId;
@@ -322,6 +328,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
             keys: raw ? Object.keys(raw) : null,
             model,
             tokensUsed,
+            userId,
             callbackUrl: resolvedCallbackUrl,
           });
           return await postCallback(
@@ -332,6 +339,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
               format: 'markdown',
               ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}),
               ...(model !== undefined ? { model } : {}),
+              ...(userId !== undefined ? { user_id: userId } : {}),
               type: 'message',
               source: 'agent',
               timestamp: new Date().toISOString(),

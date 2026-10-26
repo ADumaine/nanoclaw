@@ -7,6 +7,7 @@ import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
   formatMessages,
   extractRouting,
+  extractRawSenderIdFromJson,
   categorizeMessage,
   isClearCommand,
   isRunnerCommand,
@@ -621,6 +622,7 @@ function deliverErrorResult(text: string, routing: RoutingContext, tokensUsed?: 
       text,
       ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}),
       ...(model !== undefined ? { model } : {}),
+      ...(routing.senderId ? { user_id: routing.senderId } : {}),
     }),
   });
 }
@@ -705,10 +707,11 @@ function sendToDestination(
 ): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Resolve thread_id per-destination from the most recent inbound message
-  // that came from this same channel+platform. In agent-shared sessions,
-  // different destinations have different thread contexts — using a single
-  // routing.threadId would stamp one channel's thread onto another.
+  // Resolve thread_id (and sender) per-destination from the most recent
+  // inbound message that came from this same channel+platform. In
+  // agent-shared sessions, different destinations have different thread
+  // contexts — using the batch-level routing fields would stamp one
+  // channel's thread/sender onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
   writeMessageOut({
     id: generateId(),
@@ -724,6 +727,11 @@ function sendToDestination(
       // (there's no way to attribute tokens to one destination over another).
       ...(tokensUsed !== undefined ? { tokens_used: tokensUsed } : {}),
       ...(model !== undefined ? { model } : {}),
+      // Forwarded to the upstream API server as `user_id` on channels that
+      // support it (see webapp.ts) so per-message token usage in a shared
+      // group thread attributes to the actual sender, not the thread as a
+      // whole. See docs/mondai/community-bot-mention-filter-and-attribution.md.
+      ...((destRouting?.senderId ?? routing.senderId) ? { user_id: destRouting?.senderId ?? routing.senderId } : {}),
     }),
   });
 }
@@ -735,17 +743,17 @@ function sendToDestination(
 function resolveDestinationThread(
   channelType: string,
   platformId: string,
-): { threadId: string | null; inReplyTo: string | null } | null {
+): { threadId: string | null; inReplyTo: string | null; senderId: string | null } | null {
   try {
     const db = getInboundDb();
     const row = db
       .prepare(
-        `SELECT thread_id, id FROM messages_in
+        `SELECT thread_id, id, content FROM messages_in
          WHERE channel_type = ? AND platform_id = ?
          ORDER BY seq DESC LIMIT 1`,
       )
-      .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined;
-    if (row) return { threadId: row.thread_id, inReplyTo: row.id };
+      .get(channelType, platformId) as { thread_id: string | null; id: string; content: string } | undefined;
+    if (row) return { threadId: row.thread_id, inReplyTo: row.id, senderId: extractRawSenderIdFromJson(row.content) };
   } catch (err) {
     log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
   }
