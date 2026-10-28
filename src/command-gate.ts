@@ -83,7 +83,9 @@ export function gateCommand(
 
 function isCommunityGroup(agentGroupId: string): boolean {
   if (!hasTable(getDb(), 'agent_groups')) return false;
-  const row = getDb().prepare('SELECT folder FROM agent_groups WHERE id = ?').get(agentGroupId) as { folder: string } | undefined;
+  const row = getDb().prepare('SELECT folder FROM agent_groups WHERE id = ?').get(agentGroupId) as
+    | { folder: string }
+    | undefined;
   return row?.folder === 'community';
 }
 
