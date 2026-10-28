@@ -88,32 +88,8 @@ if (!BASE_URL) {
   // Enforced here, not left to prompt text, so a small model can't skip it.
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const NOT_LINKED_MSG =
-    'The sender has no linked CryptoMondays account. Tell them exactly: "You haven\'t connected your CryptoMondays account yet. Please send `/link` to connect your profile."' +
+    'The sender has no linked CryptoMondays account. Tell them exactly: "You haven\'t connected your CryptoMondays account yet. Please send /link to connect your profile."' +
     (APP_URL ? ` Then add: "New here? Sign up or log in at ${APP_URL}".` : '');
-
-  // Adds an absolute profile_url to each member object (Telegram can't follow
-  // relative links). `id` is profiles.id per the API team; CM_APP_URL differs
-  // per environment so the link is built here rather than hard-coded in prompts.
-  function withProfileUrls(data: unknown): unknown {
-    if (!APP_URL) return data;
-    const addTo = (item: unknown): unknown => {
-      const o = item as Record<string, unknown> | null;
-      if (o && typeof o === 'object' && typeof o.id === 'string' && UUID_RE.test(o.id)) {
-        return { ...o, profile_url: `${APP_URL}/profile/${o.id}` };
-      }
-      return item;
-    };
-    if (Array.isArray(data)) return data.map(addTo);
-    const obj = data as Record<string, unknown> | null;
-    if (obj && typeof obj === 'object') {
-      const out: Record<string, unknown> = { ...obj };
-      for (const k of ['members', 'results', 'data', 'items']) {
-        if (Array.isArray(out[k])) out[k] = (out[k] as unknown[]).map(addTo);
-      }
-      return out;
-    }
-    return data;
-  }
 
   async function apiFetch(path: string, params?: Record<string, string | number | undefined>, authId?: string): Promise<unknown> {
     const url = new URL(`${BASE_URL}${path}`);
@@ -335,7 +311,7 @@ if (!BASE_URL) {
             roles: args.roles as string | undefined,
             limit: args.limit as number | undefined,
           });
-          return ok(JSON.stringify(withProfileUrls(data), null, 2));
+          return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -457,7 +433,7 @@ if (!BASE_URL) {
             min_score: rest.min_score as number | undefined,
             limit: rest.limit as number | undefined,
           }, callerId);
-          return ok(JSON.stringify(withProfileUrls(data), null, 2));
+          return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -487,7 +463,7 @@ if (!BASE_URL) {
             min_score: rest.min_score as number | undefined,
             limit: rest.limit as number | undefined,
           }, auth_id);
-          return ok(JSON.stringify(withProfileUrls(data), null, 2));
+          return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -524,18 +500,18 @@ if (!BASE_URL) {
       },
       async handler() {
         if (!APP_URL) return err('App URL is not configured for this environment');
-        return ok(JSON.stringify({ home_url: APP_URL, onboarding_url: `${APP_URL}/onboarding` }, null, 2));
+        return ok(JSON.stringify({ home_url: APP_URL, onboarding_url: `${APP_URL}/onboarding`, profile_url_pattern: `${APP_URL}/profile/<member id>`, video_summary_url_pattern: `${APP_URL}/video/summary?id=<video_id>` }, null, 2));
       },
     },
 
     {
       tool: {
         name: 'search_videos',
-        description: 'Search the CryptoMondays video archive by keyword. Matches against video titles and descriptions. Use when the user asks about past talks, calls, events, or presentations. Results with has_summary=true include a [View Summary] link — include it in your response so users can open the summary. Each result also carries a trailing "(video_id: N)" — this is for your own use with get_video_summary/get_video_transcript if the user asks for the actual summary or transcript content; strip it out of what you actually show the user, it is not meaningful to them.',
+        description: 'Search the CryptoMondays video archive by keyword. Matches against video titles and descriptions. Use when the user asks about past talks, calls, events, or presentations. Results with a summary end in a tappable command like /summary205 — keep it exactly as written in your reply (the user taps it to get that summary in the chat). Never link to the web app. Each result also carries a trailing "(video_id: N)" — this is for your own use with get_video_summary/get_video_transcript if the user asks for the actual summary or transcript content; strip it out of what you actually show the user, it is not meaningful to them.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Keyword matched against title and description (case-insensitive)' },
+            query: { type: 'string', description: 'Keyword matched against title and description (case-insensitive).' },
             list: { type: 'string', description: 'Playlist name filter (default: "Daily Calls Video"). Pass empty string "" to search across all playlists.' },
             limit: { type: 'number', description: 'Max results to return (default 10, max 50)' },
             year: { type: 'number', description: 'Filter by year of recorded_at' },
@@ -565,8 +541,8 @@ if (!BASE_URL) {
             const meta: string[] = [];
             if (date) meta.push(date);
             if (v.list) meta.push(v.list);
-            const summaryLink = v.has_summary ? ` · [View Summary](${APP_URL}/video/summary?id=${v.id})` : '';
-            return `${titlePart}${meta.length ? ' — ' + meta.join(' · ') : ''}${summaryLink} (video_id: ${v.id})`;
+            const summaryNote = v.has_summary ? ` · /summary${v.id}` : '';
+            return `${titlePart}${meta.length ? ' — ' + meta.join(' · ') : ''}${summaryNote} (video_id: ${v.id})`;
           });
 
           const header = total > results.length ? `Showing ${results.length} of ${total} results:` : `${results.length} result${results.length === 1 ? '' : 's'}:`;
@@ -645,7 +621,7 @@ if (!BASE_URL) {
               content: JSON.stringify({ text: body }),
             });
 
-            return ok(`Sent chunk ${chunkNumber} of ${total} directly to ${routing.resolvedName} (id: ${seq}). Don't repeat this chunk's text in your own reply THIS turn — it's already been delivered once. This tool can be called again anytime for any chunk, including this same one, if asked again later (e.g. "show me chunk ${chunkNumber} again") — there is no limit on re-delivering a chunk.`);
+            return ok(`Sent chunk ${chunkNumber} of ${total} directly to ${routing.resolvedName} (id: ${seq}). Don't repeat this chunk's text in your own reply THIS turn — it's already been delivered once. Your whole reply must be exactly: ${chunkNumber < total ? `"Reply *next* for part ${chunkNumber + 1} of ${total}."` : `"That's the full ${kind}."`} Do not recap or say what you sent. This tool can be called again anytime for any chunk, including this same one, if asked again later (e.g. "show me chunk ${chunkNumber} again") — there is no limit on re-delivering a chunk.`);
           } catch (e) {
             return err(e instanceof Error ? e.message : String(e));
           }

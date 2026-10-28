@@ -32,17 +32,27 @@ export interface CommandInfo {
  * contains a `:` we assume it's pre-namespaced (non-chat-sdk adapters
  * that populate `senderId` directly) and leave it alone.
  */
+const VIDEO_TAP_RE = /^\/((summary|transcript)\d+|leadhelp)(@\w+)?$/i;
+
 export function categorizeMessage(msg: MessageInRow): CommandInfo {
   const content = parseContent(msg.content);
   const text = (content.text || '').trim();
   const senderId = extractSenderId(msg, content);
 
-  if (!text.startsWith('/')) {
+  // Tappable agent commands (/summary205, /transcript205, /leadhelp, optionally with
+  // Telegram's @bot suffix) are ordinary chat for the agent. Treating them as
+  // passthrough would send the raw text to the SDK as an unknown slash command
+  // and drop the sender's status/auth_id attributes.
+  // /help on the webapp channel is an ordinary question for the agent (the host
+  // gate lets it through there only).
+  const isWebappHelp = msg.channel_type === 'webapp' && /^\/help(@\w+)?$/i.test(text);
+  if (!text.startsWith('/') || VIDEO_TAP_RE.test(text) || isWebappHelp) {
     return { category: 'none', command: '', text, senderId };
   }
 
   // Extract the command name (e.g., '/clear' from '/clear some args')
-  const command = text.split(/\s/)[0].toLowerCase();
+  // Telegram appends @botname to commands used in groups (/help@MyBot).
+  const command = text.split(/\s/)[0].replace(/@\w+$/, '').toLowerCase();
 
   if (ADMIN_COMMANDS.has(command)) {
     return { category: 'admin', command, text, senderId };

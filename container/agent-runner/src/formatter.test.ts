@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags } from './formatter.js';
+import { categorizeMessage, formatMessages, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 beforeEach(() => {
@@ -192,5 +192,22 @@ describe('stripInternalTags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
       'The answer is 42',
     );
+  });
+});
+
+describe('video tap commands', () => {
+  const row = (text: string) =>
+    ({ id: 'm', kind: 'chat', channel_type: 'webapp', content: JSON.stringify({ text }) }) as never;
+  it('treats /summary<id> as plain chat, not a passthrough command', () => {
+    for (const t of ['/summary205', '/Summary205@MonDAIDev_bot', '/transcript12', '/leadhelp', '/leadhelp@MonDAIDev_bot']) {
+      expect(categorizeMessage(row(t)).category).toBe('none');
+    }
+  });
+  it('treats /help on the webapp channel as plain chat', () => {
+    expect(categorizeMessage(row('/help')).category).toBe('none');
+    expect(categorizeMessage(row('/help@MonDAIDev_bot')).category).toBe('none');
+  });
+  it('still passes other slash commands through', () => {
+    expect(categorizeMessage(row('/summarize')).category).toBe('passthrough');
   });
 });

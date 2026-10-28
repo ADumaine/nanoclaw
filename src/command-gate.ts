@@ -49,7 +49,13 @@ export function gateCommand(
 
   if (!text.startsWith('/')) return { action: 'pass' };
 
-  const command = text.split(/\s/)[0].toLowerCase();
+  // Telegram appends @botname to commands used in groups (/help@MyBot).
+  const command = text.split(/\s/)[0].replace(/@\w+$/, '').toLowerCase();
+
+  // /help is answered by the community agent on the webapp channel (the MonDAI
+  // API server forwards it). Other agent groups (e.g. the onboarding agent) have
+  // no /help handling, so for them it stays filtered.
+  if (command === '/help' && channelType === 'webapp' && isCommunityGroup(agentGroupId)) return { action: 'pass' };
 
   if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
 
@@ -73,6 +79,12 @@ export function gateCommand(
 
   // Unknown slash commands pass through (the agent/SDK handles them).
   return { action: 'pass' };
+}
+
+function isCommunityGroup(agentGroupId: string): boolean {
+  if (!hasTable(getDb(), 'agent_groups')) return false;
+  const row = getDb().prepare('SELECT folder FROM agent_groups WHERE id = ?').get(agentGroupId) as { folder: string } | undefined;
+  return row?.folder === 'community';
 }
 
 /** sysadmin inbound role, or NanoClaw owner via user_roles. */
