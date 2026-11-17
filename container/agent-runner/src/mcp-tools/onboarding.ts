@@ -545,8 +545,13 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
               : 'No welcome was triggered.';
           const lines = [
             `Lead email for ${d.chapter_name ?? 'the chapter'}: ${d.previous_email ?? 'none'} → ${d.new_email}.`,
-            d.lead_profile_matched ? 'A member profile matches this email.' : 'No member profile matches this email yet.',
+            d.lead_profile_matched
+              ? 'A member profile matches this email; it is now linked and the prospect name was updated from that profile.'
+              : 'No member profile matches this email yet.',
             `Stage: ${d.previous_stage} → ${d.stage}${d.stage_changed ? '' : ' (unchanged)'}.`,
+            ...(!d.stage_changed && d.previous_stage !== 'needs_attention'
+              ? ['The stage was left as is — the API only re-evaluates records at needs_attention, so a lead change mid-pipeline needs an admin to review.']
+              : []),
             welcome,
           ];
           return ok(`${lines.join('\n')}\n\nRelay exactly these facts to the admin; add nothing about emails sent.`);
