@@ -292,6 +292,19 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     return json;
   }
 
+  // Pipeline tools accept either the record UUID or the short OB- reference
+  // that onboarding_list prints (the list deliberately shows only OB-). An
+  // OB- ref is resolved through /get, which the API resolves itself, so every
+  // downstream call (including skillscript inputs) gets the real UUID.
+  const OB_REF_RE = /^OB-[0-9a-f]{6}$/i;
+  async function resolvePipelineId(ref: string): Promise<string> {
+    const id = String(ref).trim();
+    if (!OB_REF_RE.test(id)) return id;
+    const res = (await apiGet(`/agent/onboarding/get/${id}`)) as { data?: { id?: string } };
+    if (!res?.data?.id) throw new Error(`No pipeline record found for ${id}.`);
+    return res.data.id;
+  }
+
   const PROCESSING_DISABLED_MESSAGE =
     'Onboarding processing is currently disabled. To resume, re-enable it via the MonDAI admin panel → Community Manager → Onboarding config tab.';
 
@@ -417,10 +430,10 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     {
       tool: {
         name: 'onboarding_get',
-        description: 'Get a single chapter onboarding pipeline record by its UUID.',
+        description: 'Get a single chapter onboarding pipeline record by its UUID or its OB- reference (as shown in onboarding_list).',
         inputSchema: {
           type: 'object',
-          properties: { id: { type: 'string', description: 'Pipeline record UUID.' } },
+          properties: { id: { type: 'string', description: 'Pipeline record UUID or OB- reference (e.g. OB-0d0e22).' } },
           required: ['id'],
           additionalProperties: false,
         },
@@ -546,7 +559,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         inputSchema: {
           type: 'object',
           properties: {
-            id: { type: 'string' },
+            id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
             stage: { type: 'string', description: 'New stage to transition to.' },
             notes: { type: 'string', description: 'Note to log against this transition.' },
           },
@@ -558,9 +571,10 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
         try {
+          const id = await resolvePipelineId(args.id as string);
           let warning: string | undefined;
           try {
-            const current = (await apiGet(`/agent/onboarding/get/${args.id as string}`)) as {
+            const current = (await apiGet(`/agent/onboarding/get/${id}`)) as {
               data?: { stage?: string };
             };
             if (current?.data?.stage) warning = stageTransitionWarning(current.data.stage, args.stage as string);
@@ -570,7 +584,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
           const prefix = warning ? `${warning}\n\n` : '';
           if (SKILLSCRIPT_RPC_URL) {
             const vars = await executeSkill('onboarding-advance', {
-              ID: args.id as string,
+              ID: id,
               STAGE: args.stage as string,
               NOTES: (args.notes as string | undefined) ?? '',
               BASE_URL: BASE_URL as string,
@@ -578,7 +592,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             return ok(`${prefix}${JSON.stringify({ success: vars.SUCCESS === 'true', stage: vars.NEW_STAGE }, null, 2)}`);
           }
           const data = await apiPost('/agent/onboarding/advance', {
-            id: args.id as string,
+            id,
             stage: args.stage as string,
             notes: args.notes as string | undefined,
           });
@@ -596,7 +610,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         inputSchema: {
           type: 'object',
           properties: {
-            pipeline_id: { type: 'string', description: 'The pipeline record UUID — required so the correct chapter/prospect (and its Ref: tracking number) is resolved when the same email leads more than one pipeline record concurrently.' },
+            pipeline_id: { type: 'string', description: 'The pipeline record UUID or OB- reference — required so the correct chapter/prospect (and its Ref: tracking number) is resolved when the same email leads more than one pipeline record concurrently.' },
             name: { type: 'string', description: 'Exact template database name — see the template reference table for the current list. Must match exactly, including punctuation.' },
             email: { type: 'string', description: "The prospect's real email address (from the pipeline record) — used server-side for the dev-environment redirect check, not for record lookup." },
             variables: {
@@ -613,11 +627,12 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
         try {
+          const pipelineId = await resolvePipelineId(args.pipeline_id as string);
           // The skillscript path only covers the normal (no override) case —
           // a deliberate `variables` override still goes straight to the API.
           if (SKILLSCRIPT_RPC_URL && args.variables === undefined) {
             const vars = await executeSkill('onboarding-render-email', {
-              PIPELINE_ID: args.pipeline_id as string,
+              PIPELINE_ID: pipelineId,
               TEMPLATE: args.name as string,
               EMAIL: args.email as string,
               BASE_URL: BASE_URL as string,
@@ -625,7 +640,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             return ok(JSON.stringify({ subject: vars.SUBJECT, htmlBody: vars.HTML_BODY, recipient: vars.RECIPIENT }, null, 2));
           }
           const body: Record<string, unknown> = {
-            pipelineId: args.pipeline_id as string,
+            pipelineId,
             name: args.name as string,
             email: args.email as string,
           };
@@ -645,7 +660,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         inputSchema: {
           type: 'object',
           properties: {
-            id: { type: 'string' },
+            id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
             calendar_url: { type: 'string' },
             calendar_id: { type: 'string' },
           },
@@ -658,7 +673,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         if (blocked) return err(blocked);
         try {
           const data = await apiPost('/agent/onboarding/link-luma', {
-            id: args.id as string,
+            id: await resolvePipelineId(args.id as string),
             calendar_url: args.calendar_url as string,
             calendar_id: args.calendar_id as string | undefined,
           });
@@ -687,7 +702,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
               inputSchema: {
                 type: 'object',
                 properties: {
-                  id: { type: 'string' },
+                  id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
                   calendar_url: { type: 'string' },
                 },
                 required: ['id', 'calendar_url'],
@@ -699,7 +714,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
               if (blocked) return err(blocked);
               try {
                 const vars = await executeSkill('onboarding-go-live', {
-                  ID: args.id as string,
+                  ID: await resolvePipelineId(args.id as string),
                   CALENDAR_URL: args.calendar_url as string,
                   BASE_URL: BASE_URL as string,
                 });
@@ -783,7 +798,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         description: 'Mark a chapter as active (first event published) and advance its pipeline record to the terminal "active" stage. Applied transactionally on the API side. Also handles the Chapter Champions welcome announcement internally (gated on "champions_announce_new_chapter") — no separate call needed for that.',
         inputSchema: {
           type: 'object',
-          properties: { id: { type: 'string' } },
+          properties: { id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' } },
           required: ['id'],
           additionalProperties: false,
         },
@@ -792,7 +807,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
         try {
-          const data = await apiPost('/agent/onboarding/set-active', { id: args.id as string });
+          const data = await apiPost('/agent/onboarding/set-active', { id: await resolvePipelineId(args.id as string) });
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
@@ -806,7 +821,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         description: 'Mark a prospect unresponsive after exhausting follow-up/nag attempts. Applied transactionally on the API side.',
         inputSchema: {
           type: 'object',
-          properties: { id: { type: 'string' } },
+          properties: { id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' } },
           required: ['id'],
           additionalProperties: false,
         },
@@ -815,7 +830,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
         try {
-          const data = await apiPost('/agent/onboarding/mark-unresponsive', { id: args.id as string });
+          const data = await apiPost('/agent/onboarding/mark-unresponsive', { id: await resolvePipelineId(args.id as string) });
           return ok(JSON.stringify(data, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
