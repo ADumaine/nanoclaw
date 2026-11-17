@@ -293,6 +293,17 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     return json;
   }
 
+  // Admins paste addresses as "<a@b.co>", "Name <a@b.co>" or "mailto:a@b.co" (Telegram
+  // even wraps links that way). Reduce to the bare address; several addresses
+  // are refused rather than guessed at.
+  function cleanEmail(raw: string): { email: string } | { error: string } {
+    const found = raw.match(/[^\s<>,;"']+@[^\s<>,;"']+/g) ?? [];
+    const unique = [...new Set(found.map((e) => e.replace(/^mailto:/i, '').replace(/[.]+$/, '')))];
+    if (unique.length === 0) return { error: `"${raw}" does not contain an email address.` };
+    if (unique.length > 1) return { error: `Found more than one email address (${unique.join(', ')}). The lead email must be a single address — ask the admin which one.` };
+    return { email: unique[0] };
+  }
+
   // Pipeline tools accept either the record UUID or the short OB- reference
   // that onboarding_list prints (the list deliberately shows only OB-). An
   // OB- ref is resolved through /get, which the API resolves itself, so every
@@ -494,7 +505,9 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
         const blocked = await requireActive();
         if (blocked) return err(blocked);
         try {
-          const email = String(args.email).trim();
+          const cleaned = cleanEmail(String(args.email));
+          if ('error' in cleaned) return err(cleaned.error);
+          const email = cleaned.email;
           const id = await resolvePipelineId(args.id as string);
 
           // Read the current lead email in code so the "confirm before replacing"
