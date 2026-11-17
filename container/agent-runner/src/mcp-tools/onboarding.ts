@@ -286,7 +286,8 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     });
     const json = await res.json().catch(() => null);
     if (!res.ok) {
-      const message = (json as Record<string, unknown>)?.message ?? JSON.stringify(json) ?? res.statusText;
+      const body = json as Record<string, unknown> | null;
+      const message = body?.error ?? body?.message ?? JSON.stringify(json) ?? res.statusText;
       throw new Error(`${res.status}: ${String(message)}`);
     }
     return json;
@@ -451,18 +452,104 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     {
       tool: {
         name: 'onboarding_lookup',
-        description: 'Find a pipeline record by exact prospect email address. Use this to resolve an inbound email reply to its pipeline record before deciding how to respond. Do NOT guess or construct an email from a name (e.g. "jane@test.com" for someone named Jane) — a wrong guess returns an empty result identical to a real not-found, not an error. If you only have a name, use onboarding_list with no filters instead and match by name.',
+        description: 'Find pipeline records either by exact prospect email address OR by chapter name (pass exactly one). By email: resolves an inbound email reply to its pipeline record, returns a single record or null — do NOT guess or construct an email from a name; a wrong guess returns an empty result identical to a real not-found. By chapter_name: case-insensitive partial match, returns a list of matches — use this when an admin names a chapter that `get_chapters` does not find (a chapter still in onboarding may not appear there). Each record includes `id`, `ref` (OB- reference), `chapter_id`, `chapter_name`, `chapter_status`, `stage`, `prospect_email` and `chapter_lead_email`.',
         inputSchema: {
           type: 'object',
-          properties: { email: { type: 'string', description: 'Sender email address to look up. Must be the exact address on file.' } },
-          required: ['email'],
+          properties: {
+            email: { type: 'string', description: 'Sender email address to look up. Must be the exact address on file.' },
+            chapter_name: { type: 'string', description: 'Chapter name or part of it, e.g. "Houston Institutional".' },
+          },
           additionalProperties: false,
         },
       },
       async handler(args) {
+        const email = args.email as string | undefined;
+        const chapterName = args.chapter_name as string | undefined;
+        if (!!email === !!chapterName) return err('Pass exactly one of `email` or `chapter_name`.');
         try {
-          const data = await apiPost('/agent/onboarding/lookup', { email: args.email as string });
+          const data = await apiPost('/agent/onboarding/lookup', email ? { email } : { chapterName: chapterName as string });
           return ok(JSON.stringify(data, null, 2));
+        } catch (e) {
+          return err(e instanceof Error ? e.message : String(e));
+        }
+      },
+    },
+
+    {
+      tool: {
+        name: 'onboarding_set_lead',
+        description: 'Set the chapter lead email for a pipeline record — the fix for a record stuck at `needs_attention` with "Missing chapter lead email". Updates the chapter, links the lead\'s profile if one matches, keeps the pipeline\'s prospect email in step, and re-evaluates the stage. It never sends a welcome itself. If the chapter already has a DIFFERENT lead email on file this tool will NOT change it until you have asked the admin to confirm (changing it redirects every future onboarding email) and then call again with `confirmed: true`. When no email is on file, call it directly with no confirmation. Relay the returned summary to the admin as written.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
+            email: { type: 'string', description: 'The new lead email address, exactly as the admin gave it.' },
+            confirmed: { type: 'boolean', description: 'true only after the admin explicitly confirmed replacing the existing lead email shown by a previous call.' },
+          },
+          required: ['id', 'email'],
+          additionalProperties: false,
+        },
+      },
+      async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
+        try {
+          const email = String(args.email).trim();
+          const id = await resolvePipelineId(args.id as string);
+
+          // Read the current lead email in code so the "confirm before replacing"
+          // rule doesn't depend on the model remembering it.
+          const rec = (await apiGet(`/agent/onboarding/get/${id}`)) as {
+            data?: { chapter_id?: string; chapters?: { name?: string } | null };
+          };
+          const chapterId = rec?.data?.chapter_id;
+          const chapterName = rec?.data?.chapters?.name;
+          let current: string | null | undefined; // undefined = could not be read
+          if (chapterId && chapterName) {
+            const found = (await apiPost('/agent/onboarding/lookup', { chapterName })) as {
+              data?: Array<{ chapter_id?: string; chapter_lead_email?: string | null }>;
+            };
+            const match = Array.isArray(found?.data) ? found.data.find((r) => r.chapter_id === chapterId) : undefined;
+            if (match) current = match.chapter_lead_email || null;
+          }
+          const differs = current === undefined || (current !== null && current.toLowerCase() !== email.toLowerCase());
+          if (differs && args.confirmed !== true) {
+            const where = chapterName ?? 'this chapter';
+            const now = current === undefined ? 'could not be read' : `is currently ${current}`;
+            return ok(
+              `NOT CHANGED. The lead email for ${where} ${now}. Changing it to ${email} redirects every future onboarding email for this chapter. ` +
+                `Ask the admin to confirm, and only after they say yes call onboarding_set_lead again with confirmed: true.`,
+            );
+          }
+
+          const res = (await apiPost('/agent/onboarding/set-lead', { id, email })) as {
+            success?: boolean;
+            data?: {
+              chapter_name?: string;
+              previous_email?: string | null;
+              new_email?: string;
+              lead_profile_matched?: boolean;
+              previous_stage?: string;
+              stage?: string;
+              stage_changed?: boolean;
+              notified?: boolean;
+              notify_skipped_reason?: string | null;
+            };
+          };
+          const d = res?.data;
+          if (!res?.success || !d) return err(`Unexpected response: ${JSON.stringify(res)}`);
+          const welcome = d.notified
+            ? 'The onboarding agent was notified to send the welcome email; the result appears in the dashboard chat.'
+            : d.stage === 'new'
+              ? 'No welcome was triggered — someone needs to send the welcome email manually.'
+              : 'No welcome was triggered.';
+          const lines = [
+            `Lead email for ${d.chapter_name ?? 'the chapter'}: ${d.previous_email ?? 'none'} → ${d.new_email}.`,
+            d.lead_profile_matched ? 'A member profile matches this email.' : 'No member profile matches this email yet.',
+            `Stage: ${d.previous_stage} → ${d.stage}${d.stage_changed ? '' : ' (unchanged)'}.`,
+            welcome,
+          ];
+          return ok(`${lines.join('\n')}\n\nRelay exactly these facts to the admin; add nothing about emails sent.`);
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
