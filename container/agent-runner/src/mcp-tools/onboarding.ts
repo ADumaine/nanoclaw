@@ -551,11 +551,18 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
           };
           const d = res?.data;
           if (!res?.success || !d) return err(`Unexpected response: ${JSON.stringify(res)}`);
+          const reasons: Record<string, string> = {
+            manual_mode: 'onboarding automation is in manual mode',
+            notify_failed: 'the notification to the onboarding agent failed',
+            stage_unchanged: 'the stage did not change',
+            stage_not_new: 'the stage is not "new"',
+          };
+          const why = d.notify_skipped_reason ? ` (${reasons[d.notify_skipped_reason] ?? d.notify_skipped_reason})` : '';
           const welcome = d.notified
             ? 'The onboarding agent was notified to send the welcome email; the result appears in the dashboard chat.'
             : d.stage === 'new'
-              ? 'No welcome was triggered — someone needs to send the welcome email manually.'
-              : 'No welcome was triggered.';
+              ? `No welcome was triggered${why} — someone needs to send the welcome email manually.`
+              : `No welcome was triggered${why}.`;
           const lines = [
             `Lead email for ${d.chapter_name ?? 'the chapter'}: ${d.previous_email ?? 'none'} → ${d.new_email}.`,
             d.lead_profile_matched
