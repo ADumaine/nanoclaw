@@ -538,7 +538,9 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
           }
           const lower = email.toLowerCase();
           const firstOf = (v: string) => v.split(',')[0].trim().toLowerCase();
-          const pendingLead = current ? firstOf(current) : null;
+          // With a registered lead the field holds ONLY co-organizers, so its
+          // first address is not the lead and must not count as "same lead".
+          const pendingLead = current && !registeredLead ? firstOf(current) : null;
           const sameAsPending = pendingLead === lower;
           const sameAsRegistered = registeredLead !== null && registeredLead.trim().toLowerCase() === lower;
           const hasExistingLead = current !== null || registeredLead !== null;
@@ -557,7 +559,7 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             );
           }
 
-          const res = (await apiPost('/agent/onboarding/set-lead', { id, email })) as {
+          const res = (await apiPost('/agent/onboarding/set-lead', { id, email, ...(args.confirmed === true ? { force: true } : {}) })) as {
             success?: boolean;
             data?: {
               chapter_name?: string;
