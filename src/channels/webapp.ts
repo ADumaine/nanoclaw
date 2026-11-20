@@ -64,11 +64,38 @@ const DEFAULT_BIND_HOST = '127.0.0.1';
 
 registerChannelAdapter(CHANNEL_TYPE, {
   factory: () => {
-    const env = readEnvFile(['WEBAPP_SHARED_SECRET', 'WEBAPP_CALLBACK_URL', 'WEBAPP_PORT', 'WEBAPP_BIND_HOST']);
+    const env = readEnvFile([
+      'WEBAPP_SHARED_SECRET',
+      'WEBAPP_CALLBACK_URL',
+      'WEBAPP_PORT',
+      'WEBAPP_BIND_HOST',
+      'WEBAPP_REQUIRE_LINKED_APP_IDS',
+    ]);
 
     if (!env.WEBAPP_SHARED_SECRET || !env.WEBAPP_CALLBACK_URL) return null;
 
     const sharedSecret = env.WEBAPP_SHARED_SECRET;
+
+    // app_ids (comma-separated, bare — e.g. "telegram_onboarding_bot") whose
+    // senders must have a MonDAI profile linked to their Telegram account
+    // before a message is processed. Empty (default) = no check. An unlinked
+    // sender is answered with the link instructions and never reaches the
+    // access gate or the agent. See docs/mondai/api-request-linked-sender-gate-2026-11-20.md.
+    const requireLinkedAppIds = new Set(
+      (env.WEBAPP_REQUIRE_LINKED_APP_IDS ?? '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean),
+    );
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const LINK_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+    const lastLinkNotice = new Map<string, number>();
+    const LINK_NOTICE_TEXT =
+      'To use this bot, your Telegram account must be linked to your MonDAI account:\n' +
+      '1. Log in to the MonDAI app (https://mondai.cryptomondays.io/). If you have no account yet, register first.\n' +
+      '2. Open your Profile settings, then External Connections, and click Link Telegram to get a 6-digit code.\n' +
+      '3. In a private direct message with this bot, send /link followed by the code (for example /link 123456).\n' +
+      'Then message me again.';
     const callbackUrl = env.WEBAPP_CALLBACK_URL;
     // Per-app_id overrides: WEBAPP_CALLBACK_URL_<app_id>=http://...
     // Allows dev and beta API servers to share one NanoClaw instance.
@@ -224,6 +251,41 @@ registerChannelAdapter(CHANNEL_TYPE, {
         log.info('Webapp: question response received', { question_id, selected_option, user_id });
         setupConfig!.onAction(question_id, selected_option, `${CHANNEL_TYPE}:${user_id}`);
         return;
+      }
+
+      // Linked-sender gate (opt-in per app_id). The API sends `linked: true`
+      // for a sender whose Telegram account is linked; until it does, fall
+      // back to the user_id shape (linked senders arrive as the profile UUID,
+      // unlinked ones as a raw Telegram id). Button presses are handled
+      // above and are deliberately not gated.
+      if (requireLinkedAppIds.has(app_id!)) {
+        const isLinked = body.linked === true || (body.linked === undefined && UUID_RE.test(user_id!));
+        if (!isLinked) {
+          log.info('Webapp: sender not linked — link notice sent, message not processed', {
+            app_id,
+            user_id,
+            thread_id,
+          });
+          const now = Date.now();
+          const last = lastLinkNotice.get(`${app_id}:${user_id}`) ?? 0;
+          if (now - last >= LINK_NOTICE_INTERVAL_MS) {
+            lastLinkNotice.set(`${app_id}:${user_id}`, now);
+            const appKey = app_id!;
+            void postCallback(
+              {
+                app_id: `${CHANNEL_TYPE}:${appKey}`,
+                thread_id,
+                content: LINK_NOTICE_TEXT,
+                format: 'markdown',
+                type: 'message',
+                source: 'agent',
+                timestamp: new Date().toISOString(),
+              },
+              callbackUrlOverrides[appKey] ?? callbackUrl,
+            ).catch((err) => log.warn('Webapp: link notice failed', { err }));
+          }
+          return;
+        }
       }
 
       log.info('Webapp: routing message', { app_id, user_id, thread_id, platformId: `webapp:${app_id}` });
