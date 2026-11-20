@@ -262,12 +262,19 @@ function obRef(id: string): string {
     // back, so paging never skips a chapter.
     const next = hidden > 0 ? offset + kept.length : nextApi;
     const more = hidden > 0 || truncatedByApi || nextApi !== null;
-    const shown = `showing ${offset + 1}–${offset + kept.length}`;
+    // The admin-facing last line says exactly what to type to continue, so
+    // nobody has to guess a phrase; the bracketed line is for the model only.
     const footer = more
-      ? `\n\n⚠️ Not the full list (${shown}). More chapters match${
-          next !== null ? ` — to see the next page call onboarding_chapters again with offset ${next} and the same filters` : ''
-        }. Tell the admin this is not everything.`
-      : '';
+      ? `\n\n➡️ Not the full list (showing ${offset + 1}–${offset + kept.length}). ${
+          next !== null ? `Reply "next page" for more.` : 'Narrow it with a name, status or country.'
+        }${
+          next !== null
+            ? `\n\n[Instruction for you, not to be shown: relay the ➡️ line above exactly as written. When the admin asks for the next page, call onboarding_chapters with offset ${next} and the same q/status/country.]`
+            : ''
+        }`
+      : offset > 0
+        ? `\n\n✅ That's the end of the list (showing ${offset + 1}–${offset + kept.length}).`
+        : '';
     return `${kept.join('\n')}${footer}`;
   }
 
