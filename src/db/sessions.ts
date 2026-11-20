@@ -87,6 +87,25 @@ export function findRecentPlatformIdForHandle(channelType: string, handle: strin
   return row?.platform_id;
 }
 
+/**
+ * Thread id of the most recently active session for a handle on a channel
+ * (same substring convention as findRecentPlatformIdForHandle). Used to
+ * address cold DMs on thread-addressed channels.
+ */
+export function findRecentThreadForHandle(channelType: string, handle: string): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT s.thread_id AS thread_id
+         FROM sessions s
+         JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+        WHERE mg.channel_type = ? AND s.thread_id IS NOT NULL AND s.thread_id LIKE '%' || ? || '%'
+     ORDER BY s.last_active DESC
+        LIMIT 1`,
+    )
+    .get(channelType, handle) as { thread_id: string } | undefined;
+  return row?.thread_id;
+}
+
 export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }

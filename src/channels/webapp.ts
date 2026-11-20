@@ -45,7 +45,12 @@ import fs from 'fs';
 import http from 'http';
 
 import { getMessagingGroupByPlatform } from '../db/messaging-groups.js';
-import { findRecentPlatformIdForHandle, findSession, deleteSession } from '../db/sessions.js';
+import {
+  findRecentPlatformIdForHandle,
+  findRecentThreadForHandle,
+  findSession,
+  deleteSession,
+} from '../db/sessions.js';
 import { readEnvFile, readEnvPrefix } from '../env.js';
 import { log } from '../log.js';
 import { killContainer } from '../container-runner.js';
@@ -93,6 +98,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
     async function postCallback(
       payload: Record<string, unknown>,
       targetUrl = callbackUrl,
+      throwOnError = false,
     ): Promise<string | undefined> {
       const response = await fetch(targetUrl, {
         method: 'POST',
@@ -111,6 +117,7 @@ registerChannelAdapter(CHANNEL_TYPE, {
         } else {
           log.warn('Webapp: callback delivery failed', { status: response.status, body });
         }
+        if (throwOnError) throw new Error(`callback rejected with HTTP ${response.status}`);
         return undefined;
       }
       const result = (await response.json()) as Record<string, unknown>;
@@ -305,9 +312,53 @@ registerChannelAdapter(CHANNEL_TYPE, {
         // operator's Community Assistant chat history this way. Dropping here
         // (best-effort, matches the existing catch-block contract below) is
         // safer than shipping a callback we know will be misrouted.
+        const rawContent = message.content as Record<string, unknown> | null;
+        const isQuestion = rawContent?.type === 'ask_question';
         if (!threadId) {
           log.error('Webapp: refusing to deliver — no thread_id resolved', { platformId });
+          // Approval cards must fail loudly so the caller does not log or
+          // announce a delivery that never happened. Ordinary messages keep
+          // the best-effort contract.
+          if (isQuestion) throw new Error('no thread_id resolved for question card');
           return undefined;
+        }
+        if (isQuestion) {
+          const appId = platformId.startsWith(`${CHANNEL_TYPE}:`)
+            ? platformId.slice(CHANNEL_TYPE.length + 1)
+            : platformId;
+          const options = Array.isArray(rawContent?.options)
+            ? (rawContent!.options as Array<Record<string, unknown>>)
+            : [];
+          const title = typeof rawContent?.title === 'string' ? rawContent.title : '';
+          const question = typeof rawContent?.question === 'string' ? rawContent.question : '';
+          // `content` is a readable fallback: an API that cannot render
+          // buttons still posts it as an ordinary message instead of
+          // rejecting the callback.
+          const fallback = [
+            title,
+            question,
+            options.length ? `Options: ${options.map((o) => String(o.label ?? o.value)).join(' / ')}` : '',
+            '(Buttons unavailable — approve from the host: ncl members add.)',
+          ]
+            .filter(Boolean)
+            .join('\n');
+          return await postCallback(
+            {
+              app_id: platformId,
+              thread_id: threadId,
+              type: 'question',
+              question_id: rawContent?.questionId,
+              title,
+              question,
+              options,
+              content: fallback,
+              format: 'markdown',
+              source: 'agent',
+              timestamp: new Date().toISOString(),
+            },
+            callbackUrlOverrides[appId] ?? callbackUrl,
+            true,
+          );
         }
         try {
           const raw = message.content as Record<string, unknown> | null;
@@ -382,6 +433,15 @@ registerChannelAdapter(CHANNEL_TYPE, {
       // approval-card delivery sent app_id="5945384141" instead of
       // "webapp:telegram_onboarding_bot", and the receiving API server had
       // to guess a fallback thread — and guessed wrong).
+      // Thread for a cold DM to this handle: the most recent session thread
+      // containing the handle, else the observed `telegram_<numericId>`
+      // convention for a bare numeric (Telegram) handle.
+      resolveDmThread(handle: string): string | null {
+        const found = findRecentThreadForHandle(CHANNEL_TYPE, handle);
+        if (found) return found;
+        return /^\d+$/.test(handle) ? `telegram_${handle}` : null;
+      },
+
       async openDM(handle: string): Promise<string> {
         const platformId = findRecentPlatformIdForHandle(CHANNEL_TYPE, handle);
         if (!platformId) {

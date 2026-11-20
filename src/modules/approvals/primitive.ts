@@ -22,6 +22,7 @@
  * if either module becomes genuinely optional (see REFACTOR_PLAN open q #3).
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
+import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createPendingApproval, getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
@@ -175,6 +176,17 @@ export async function pickApprovalDelivery(
   return null;
 }
 
+/**
+ * Thread id for a cold approval DM to `userId` on `channelType`, for channels
+ * that address DMs by thread (the webapp bridge refuses to deliver without
+ * one). null when the channel doesn't need or can't resolve one.
+ */
+export function resolveApprovalThread(channelType: string, userId: string): string | null {
+  const idx = userId.indexOf(':');
+  const handle = idx < 0 ? userId : userId.slice(idx + 1);
+  return getChannelAdapter(channelType)?.resolveDmThread?.(handle) ?? null;
+}
+
 function channelTypeOf(userId: string): string {
   const idx = userId.indexOf(':');
   return idx < 0 ? '' : userId.slice(0, idx);
@@ -259,7 +271,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
       await adapter.deliver(
         target.messagingGroup.channel_type,
         target.messagingGroup.platform_id,
-        null,
+        resolveApprovalThread(target.messagingGroup.channel_type, target.userId),
         'chat-sdk',
         JSON.stringify({
           type: 'ask_question',

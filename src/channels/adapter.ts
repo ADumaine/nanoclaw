@@ -176,6 +176,14 @@ export interface ChannelAdapter {
    * Returning the same platform_id on repeated calls is expected.
    */
   openDM?(userHandle: string): Promise<string>;
+
+  /**
+   * Thread id to use when the host cold-delivers to a user's DM on a
+   * thread-addressed channel (the webapp bridge refuses to deliver without
+   * one). Returns null when none can be determined. Omit on channels where
+   * threadId is not required for a DM.
+   */
+  resolveDmThread?(userHandle: string): string | null;
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */

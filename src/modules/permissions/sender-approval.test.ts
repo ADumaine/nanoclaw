@@ -185,6 +185,32 @@ describe('unknown-sender request_approval flow', () => {
     expect(rows).toHaveLength(1);
   });
 
+  it('does not claim success when the approval card cannot be delivered', async () => {
+    deliverMock.mockImplementation(async (_ch: string, platformId: string) => {
+      if (platformId === 'dm-owner') throw new Error('no thread_id resolved for question card');
+      return 'plat-msg-id';
+    });
+    try {
+      const { routeInbound } = await import('../../router.js');
+      await routeInbound(stranger('hi'));
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Row removed so a retry is not deduplicated into silence.
+      const { getDb } = await import('../../db/connection.js');
+      expect(getDb().prepare('SELECT * FROM pending_sender_approvals').all()).toHaveLength(0);
+
+      // Requester is told the truth, never "sent your access request".
+      const noticeCall = deliverMock.mock.calls.find((c) => c[1] === 'chat-123');
+      expect(noticeCall).toBeDefined();
+      const text = JSON.parse(noticeCall![4] as string).text as string;
+      expect(text).toMatch(/couldn't reach an admin/);
+      expect(text).not.toMatch(/sent your access request/);
+    } finally {
+      deliverMock.mockReset();
+      deliverMock.mockResolvedValue('plat-msg-id');
+    }
+  });
+
   it('escapes Telegram Markdown special characters in the sender display name', async () => {
     // Confirmed live 2026-07-23: an unescaped "_" in a real sender's display
     // name (e.g. "Robin_Philip") broke Telegram's Markdown parser — the

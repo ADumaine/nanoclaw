@@ -31,8 +31,12 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
-import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
-import { createPendingSenderApproval, hasInFlightSenderApproval } from './db/pending-sender-approvals.js';
+import { pickApprovalDelivery, pickApprover, resolveApprovalThread } from '../approvals/primitive.js';
+import {
+  createPendingSenderApproval,
+  deletePendingSenderApproval,
+  hasInFlightSenderApproval,
+} from './db/pending-sender-approvals.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve' },
@@ -79,27 +83,20 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     return;
   }
 
-  // Best-effort notice back to the requester, gated the same as the approval
-  // card (once per pending request, not once per retry). Without this, a
-  // first-time sender gets total silence — POST /message always returns 202
-  // immediately regardless of what happens next, and nothing else in this
-  // flow replies to the original thread. Silence reads as "broken" on a
-  // webapp chat interface in particular, where near-instant replies are the
-  // norm. Fire-and-forget on purpose — sent before approver resolution, so
-  // it goes out even in the (already-broken) edge case where no approver is
-  // configured; that's a minor secondary problem, not worth blocking on.
-  const notifyAdapter = getDeliveryAdapter();
-  if (notifyAdapter) {
+  // Best-effort notice back to the requester. It is sent only once the
+  // outcome is known: "request sent" after the approval card was actually
+  // delivered, or "couldn't reach an admin" when it was not. (It used to go
+  // out first, so a requester was told an admin had been asked even when no
+  // card could ever be delivered.) Fire-and-forget on purpose.
+  const notifyRequester = (text: string): void => {
+    const notifyAdapter = getDeliveryAdapter();
+    if (!notifyAdapter) return;
     void notifyAdapter
-      .deliver(
-        event.channelType,
-        event.platformId,
-        event.threadId,
-        'chat',
-        JSON.stringify({ text: "Thanks — I've sent your access request to an admin for approval." }),
-      )
+      .deliver(event.channelType, event.platformId, event.threadId, 'chat', JSON.stringify({ text }))
       .catch((err) => log.error('Pending-approval notice failed to send', { err }));
-  }
+  };
+  const NOT_REACHED =
+    "I couldn't reach an admin to approve your access just now. Please contact an admin directly and ask them to add you.";
 
   const approvers = pickApprover(agentGroupId);
   if (approvers.length === 0) {
@@ -108,6 +105,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
+    notifyRequester(NOT_REACHED);
     return;
   }
 
@@ -120,6 +118,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
+    notifyRequester(NOT_REACHED);
     return;
   }
 
@@ -158,6 +157,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     log.error('Unknown-sender approval row created but no delivery adapter is wired', {
       approvalId,
     });
+    notifyRequester(NOT_REACHED);
     return;
   }
 
@@ -165,7 +165,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     await adapter.deliver(
       target.messagingGroup.channel_type,
       target.messagingGroup.platform_id,
-      null,
+      resolveApprovalThread(target.messagingGroup.channel_type, target.userId),
       'chat-sdk',
       JSON.stringify({
         type: 'ask_question',
@@ -182,11 +182,16 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       messagingGroupId,
       agentGroupId,
     });
+    notifyRequester("Thanks — I've sent your access request to an admin for approval.");
   } catch (err) {
     log.error('Unknown-sender approval card delivery failed', {
       approvalId,
       err,
     });
+    // Drop the row so the dedup gate doesn't suppress every future attempt
+    // (and the requester's retry gets another chance), and tell the requester.
+    deletePendingSenderApproval(approvalId);
+    notifyRequester(NOT_REACHED);
   }
 }
 
