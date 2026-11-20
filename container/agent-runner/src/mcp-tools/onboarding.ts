@@ -510,13 +510,24 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
           const email = cleaned.email;
           const id = await resolvePipelineId(args.id as string);
 
-          // Read the current lead email in code so the "confirm before replacing"
-          // rule doesn't depend on the model remembering it.
+          // Read the current lead in code so the "confirm before replacing"
+          // rule doesn't depend on the model remembering it. Two places hold
+          // it: chapters.chapter_lead_email (pending people, lead first) and,
+          // once the lead has registered, a profile link — the registered
+          // lead's email is REMOVED from the email field, so a blank field
+          // does not mean "no lead". profile_state/prospect_email on the
+          // pipeline record are the only signal of that exposed today.
           const rec = (await apiGet(`/agent/onboarding/get/${id}`)) as {
-            data?: { chapter_id?: string; chapters?: { name?: string } | null };
+            data?: {
+              chapter_id?: string;
+              prospect_email?: string | null;
+              profile_state?: string | null;
+              chapters?: { name?: string } | null;
+            };
           };
           const chapterId = rec?.data?.chapter_id;
           const chapterName = rec?.data?.chapters?.name;
+          const registeredLead = rec?.data?.profile_state === 'registered' ? rec?.data?.prospect_email || null : null;
           let current: string | null | undefined; // undefined = could not be read
           if (chapterId && chapterName) {
             const found = (await apiPost('/agent/onboarding/lookup', { chapterName })) as {
@@ -525,12 +536,23 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
             const match = Array.isArray(found?.data) ? found.data.find((r) => r.chapter_id === chapterId) : undefined;
             if (match) current = match.chapter_lead_email || null;
           }
-          const differs = current === undefined || (current !== null && current.toLowerCase() !== email.toLowerCase());
+          const lower = email.toLowerCase();
+          const firstOf = (v: string) => v.split(',')[0].trim().toLowerCase();
+          const pendingLead = current ? firstOf(current) : null;
+          const sameAsPending = pendingLead === lower;
+          const sameAsRegistered = registeredLead !== null && registeredLead.trim().toLowerCase() === lower;
+          const hasExistingLead = current !== null || registeredLead !== null;
+          const differs =
+            current === undefined || (hasExistingLead && !(sameAsPending || sameAsRegistered));
           if (differs && args.confirmed !== true) {
             const where = chapterName ?? 'this chapter';
-            const now = current === undefined ? 'could not be read' : `is currently ${current}`;
+            const parts: string[] = [];
+            if (registeredLead) parts.push(`a registered member lead (${registeredLead})`);
+            if (current) parts.push(`the lead email field "${current}"`);
+            const now = current === undefined ? 'could not be read' : `currently has ${parts.join(' and ')}`;
             return ok(
-              `NOT CHANGED. The lead email for ${where} ${now}. Changing it to ${email} redirects every future onboarding email for this chapter. ` +
+              `NOT CHANGED. ${where} ${now}. Changing the lead to ${email} redirects every future onboarding email for this chapter` +
+                `${registeredLead ? ' and replaces a registered lead' : ''}. ` +
                 `Ask the admin to confirm, and only after they say yes call onboarding_set_lead again with confirmed: true.`,
             );
           }
