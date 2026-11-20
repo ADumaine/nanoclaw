@@ -222,6 +222,8 @@ function obRef(id: string): string {
       | undefined;
     if (!Array.isArray(rows)) return null;
     const truncatedByApi = res.truncated === true || container?.truncated === true;
+    const offset = typeof container?.offset === 'number' ? container.offset : 0;
+    const nextApi = typeof container?.next_offset === 'number' ? container.next_offset : null;
     if (rows.length === 0) return 'No chapters match that search.';
     const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '');
     const leadLabel: Record<string, string> = {
@@ -256,11 +258,15 @@ function obRef(id: string): string {
       used += line.length + 1;
     }
     const hidden = lines.length - kept.length;
-    const notes: string[] = [];
-    if (hidden > 0) notes.push(`${hidden} more match(es) did not fit in one message`);
-    if (truncatedByApi) notes.push('the search returned its maximum of 50 and more chapters match');
-    const footer = notes.length
-      ? `\n\n⚠️ Not the full list: ${notes.join('; ')}. Ask the admin to narrow it with a name, status or country.`
+    // Rows dropped to fit one message are re-offered by moving the offset
+    // back, so paging never skips a chapter.
+    const next = hidden > 0 ? offset + kept.length : nextApi;
+    const more = hidden > 0 || truncatedByApi || nextApi !== null;
+    const shown = `showing ${offset + 1}–${offset + kept.length}`;
+    const footer = more
+      ? `\n\n⚠️ Not the full list (${shown}). More chapters match${
+          next !== null ? ` — to see the next page call onboarding_chapters again with offset ${next} and the same filters` : ''
+        }. Tell the admin this is not everything.`
       : '';
     return `${kept.join('\n')}${footer}`;
   }
@@ -509,13 +515,14 @@ function obRef(id: string): string {
     {
       tool: {
         name: 'onboarding_chapters',
-        description: 'Search ALL chapters — not just those in the onboarding pipeline — by name or city, optionally filtered by status and/or country. Use it to (1) check whether a chapter already exists before creating a new onboarding record, (2) answer "which chapters are active / planned / in onboarding", and (3) find a chapter that onboarding_list does not have. Returns at most 50 matches and says when there are more: if so, tell the admin the list is cut off and ask them to narrow it with a name, status or country — never claim it is the complete list. Each row shows name, city, country, status, pipeline stage (if any), OB- reference (if any) and lead status. Read-only.',
+        description: 'Search ALL chapters — not just those in the onboarding pipeline — by name or city, optionally filtered by status and/or country. Use it to (1) check whether a chapter already exists before creating a new onboarding record, (2) answer "which chapters are active / planned / in onboarding", and (3) find a chapter that onboarding_list does not have. Returns up to 50 matches per page and says when more match: if so, tell the admin it is page 1 of more and offer the next page (call again with the given `offset` and the same filters) — never present one page as the complete list. If the admin wants everything, keep paging until no more are reported. Each row shows name, city, country, status, pipeline stage (if any), OB- reference (if any) and lead status. Read-only.',
         inputSchema: {
           type: 'object',
           properties: {
             q: { type: 'string', description: 'Chapter name or city, partial match (e.g. "houston").' },
             status: { type: 'string', description: 'Chapter status filter, e.g. "active", "planned", "onboarding".' },
             country: { type: 'string', description: 'Country filter.' },
+            offset: { type: 'number', description: 'Start position for paging. Omit for the first page; when a result says more chapters match, call again with the offset it gives and the SAME filters.' },
           },
           additionalProperties: false,
         },
@@ -526,6 +533,7 @@ function obRef(id: string): string {
             q: args.q as string | undefined,
             status: args.status as string | undefined,
             country: args.country as string | undefined,
+            offset: typeof args.offset === 'number' ? args.offset : undefined,
           })) as Record<string, unknown> | null;
           return ok(formatChapterSearch(res) ?? JSON.stringify(res, null, 2));
         } catch (e) {
