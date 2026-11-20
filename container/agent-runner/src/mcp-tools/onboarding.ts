@@ -150,7 +150,10 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${hh}:${mm} UTC`;
   }
 
-  function obRef(id: string): string {
+  /** Placeholder the API writes as prospect_email when a chapter has no lead (onboarding.js). */
+const PLACEHOLDER_LEAD_EMAIL = /^unknown@cryptomondays\.io$/i;
+
+function obRef(id: string): string {
     return `OB-${String(id).replace(/-/g, '').slice(0, 6)}`;
   }
 
@@ -182,7 +185,11 @@ if (!BASE_URL || !IS_ONBOARDING_AGENT) {
     // — "find by name, then use their real email" is a documented rule above
     // that depends on the email actually being visible in onboarding_list output.
     return [
-      `**${r.prospect_name}** (${r.prospect_email ?? 'no email on file'}) — ${obRef(r.id)}`,
+      // The API stores unknown@cryptomondays.io when a chapter was onboarded
+      // with no lead — show that as "no lead set", never as a real contact.
+      PLACEHOLDER_LEAD_EMAIL.test(r.prospect_email ?? '')
+        ? `**No lead set** — ${obRef(r.id)}`
+        : `**${r.prospect_name}** (${r.prospect_email ?? 'no email on file'}) — ${obRef(r.id)}`,
       `Chapter: ${chapterName}${chapterName && location ? ' — ' : ''}${location}${statusSuffix}`,
       `Stage: ${stageDisplay}${notes}`,
       `Last contact: ${formatUtc(r.last_contact_at)}`,
