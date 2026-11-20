@@ -207,6 +207,59 @@ function obRef(id: string): string {
   const VERBATIM_DIRECTIVE =
     '[Relay the record list below to the admin exactly as written — same line breaks, same OB- references, same chapter names, same wording. Do not paraphrase, reformat, condense to one line per record, drop any field, or offer a CSV/JSON export instead.]';
 
+  // Compact chapter-search rows. The API contract (2026-11-20): GET
+  // /agent/onboarding/chapters returns name, city, country, status, pipeline
+  // stage, OB- ref and lead (registered | email_only | none), at most 50, with
+  // a `truncated` flag. Field names are read tolerantly; anything
+  // unrecognised makes the caller fall back to raw JSON rather than guessing.
+  const CHAPTER_SEARCH_MAX_CHARS = 3500; // Telegram caps a message at 4096
+  function formatChapterSearch(res: Record<string, unknown> | null): string | null {
+    if (!res || typeof res !== 'object') return null;
+    const data = res.data as unknown;
+    const container = Array.isArray(data) ? null : (data as Record<string, unknown> | undefined);
+    const rows = (Array.isArray(data) ? data : (container?.chapters ?? container?.rows ?? container?.results)) as
+      | Array<Record<string, unknown>>
+      | undefined;
+    if (!Array.isArray(rows)) return null;
+    const truncatedByApi = res.truncated === true || container?.truncated === true;
+    if (rows.length === 0) return 'No chapters match that search.';
+    const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+    const leadLabel: Record<string, string> = {
+      registered: 'lead registered',
+      email_only: 'lead email only (not registered)',
+      none: 'no lead',
+    };
+    const lines = rows.map((r) => {
+      const place = [str(r.city), str(r.country)].filter(Boolean).join(', ');
+      const stage = str(r.stage) || str(r.pipeline_stage);
+      const lead = str(r.lead);
+      return [
+        `**${str(r.name) || str(r.chapter_name) || 'Unnamed'}**${place ? ` — ${place}` : ''}`,
+        `status: ${str(r.status) || 'unknown'}`,
+        stage ? `stage: ${stage}` : 'not in onboarding',
+        str(r.ref),
+        lead ? (leadLabel[lead] ?? lead) : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    });
+    const kept: string[] = [];
+    let used = 0;
+    for (const line of lines) {
+      if (used + line.length + 1 > CHAPTER_SEARCH_MAX_CHARS) break;
+      kept.push(line);
+      used += line.length + 1;
+    }
+    const hidden = lines.length - kept.length;
+    const notes: string[] = [];
+    if (hidden > 0) notes.push(`${hidden} more match(es) did not fit in one message`);
+    if (truncatedByApi) notes.push('the search returned its maximum of 50 and more chapters match');
+    const footer = notes.length
+      ? `\n\n⚠️ Not the full list: ${notes.join('; ')}. Ask the admin to narrow it with a name, status or country.`
+      : '';
+    return `${kept.join('\n')}${footer}`;
+  }
+
   function formatPipelineList(data: unknown): string | undefined {
     const records = (data as { success?: boolean; data?: PipelineRecordLike[] })?.data;
     if (!Array.isArray(records)) return undefined;
@@ -429,6 +482,7 @@ function obRef(id: string): string {
           properties: {
             stage: { type: 'string', description: 'Filter by pipeline stage (e.g. "invited", "nagging").' },
             email: { type: 'string', description: 'Filter by prospect email. Must be the exact address on file — do not guess or construct one from a name.' },
+            chapter_status: { type: 'string', description: 'Filter by the chapter\'s own status (e.g. "active", "onboarding"). Note this only covers chapters that HAVE a pipeline record — to see all chapters in a status, use onboarding_chapters.' },
           },
           additionalProperties: false,
         },
@@ -438,8 +492,37 @@ function obRef(id: string): string {
           const data = await apiGet('/agent/onboarding/list', {
             stage: args.stage as string | undefined,
             email: args.email as string | undefined,
+            chapterStatus: args.chapter_status as string | undefined,
           });
           return ok(formatPipelineList(data) ?? JSON.stringify(data, null, 2));
+        } catch (e) {
+          return err(e instanceof Error ? e.message : String(e));
+        }
+      },
+    },
+
+    {
+      tool: {
+        name: 'onboarding_chapters',
+        description: 'Search ALL chapters — not just those in the onboarding pipeline — by name or city, optionally filtered by status and/or country. Use it to (1) check whether a chapter already exists before creating a new onboarding record, (2) answer "which chapters are active / planned / in onboarding", and (3) find a chapter that onboarding_list does not have. Returns at most 50 matches and says when there are more: if so, tell the admin the list is cut off and ask them to narrow it with a name, status or country — never claim it is the complete list. Each row shows name, city, country, status, pipeline stage (if any), OB- reference (if any) and lead status. Read-only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            q: { type: 'string', description: 'Chapter name or city, partial match (e.g. "houston").' },
+            status: { type: 'string', description: 'Chapter status filter, e.g. "active", "planned", "onboarding".' },
+            country: { type: 'string', description: 'Country filter.' },
+          },
+          additionalProperties: false,
+        },
+      },
+      async handler(args) {
+        try {
+          const res = (await apiGet('/agent/onboarding/chapters', {
+            q: args.q as string | undefined,
+            status: args.status as string | undefined,
+            country: args.country as string | undefined,
+          })) as Record<string, unknown> | null;
+          return ok(formatChapterSearch(res) ?? JSON.stringify(res, null, 2));
         } catch (e) {
           return err(e instanceof Error ? e.message : String(e));
         }
@@ -615,7 +698,7 @@ function obRef(id: string): string {
     {
       tool: {
         name: 'onboarding_create',
-        description: 'Create a new chapter onboarding pipeline entry and a linked chapter (status "onboarding"). Check onboarding_list first to avoid creating a duplicate for the same prospect. The API checks for an existing chapter by exact `name` (not `city`) — a city can legitimately host more than one chapter, e.g. "New York City - Wall Street" and "New York City - Uptown".',
+        description: 'Create a new chapter onboarding pipeline entry and a linked chapter (status "onboarding"). Before creating, call onboarding_chapters with the chapter name/city to check whether the chapter already exists in ANY status (onboarding_list only covers chapters already in the pipeline), and onboarding_list to avoid a duplicate record for the same prospect. The API checks for an existing chapter by exact `name` (not `city`) — a city can legitimately host more than one chapter, e.g. "New York City - Wall Street" and "New York City - Uptown".',
         inputSchema: {
           type: 'object',
           properties: {
