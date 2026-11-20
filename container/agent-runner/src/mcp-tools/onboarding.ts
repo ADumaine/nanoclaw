@@ -212,7 +212,7 @@ function obRef(id: string): string {
   // stage, OB- ref and lead (registered | email_only | none), at most 50, with
   // a `truncated` flag. Field names are read tolerantly; anything
   // unrecognised makes the caller fall back to raw JSON rather than guessing.
-  const CHAPTER_SEARCH_MAX_CHARS = 3500; // Telegram caps a message at 4096
+  const CHAPTER_SEARCH_MAX_CHARS = 3800; // Telegram caps a message at 4096 (leave room for the footer)
   function formatChapterSearch(res: Record<string, unknown> | null): string | null {
     if (!res || typeof res !== 'object') return null;
     const data = res.data as unknown;
@@ -225,18 +225,23 @@ function obRef(id: string): string {
     if (rows.length === 0) return 'No chapters match that search.';
     const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '');
     const leadLabel: Record<string, string> = {
-      registered: 'lead registered',
-      email_only: 'lead email only (not registered)',
+      registered: 'lead: registered',
+      email_only: 'lead: email only',
       none: 'no lead',
     };
     const lines = rows.map((r) => {
-      const place = [str(r.city), str(r.country)].filter(Boolean).join(', ');
+      const name = str(r.name) || str(r.chapter_name) || 'Unnamed';
+      const city = str(r.city);
+      // Skip the city when it just repeats the chapter name.
+      const place = [city && city.toLowerCase() !== name.toLowerCase() ? city : '', str(r.country)]
+        .filter(Boolean)
+        .join(', ');
       const stage = str(r.stage) || str(r.pipeline_stage);
       const lead = str(r.lead);
       return [
-        `**${str(r.name) || str(r.chapter_name) || 'Unnamed'}**${place ? ` — ${place}` : ''}`,
-        `status: ${str(r.status) || 'unknown'}`,
-        stage ? `stage: ${stage}` : 'not in onboarding',
+        `**${name}**${place ? `, ${place}` : ''}`,
+        str(r.status) || 'unknown',
+        stage ? `stage: ${stage}` : 'no pipeline',
         str(r.ref),
         lead ? (leadLabel[lead] ?? lead) : '',
       ]
