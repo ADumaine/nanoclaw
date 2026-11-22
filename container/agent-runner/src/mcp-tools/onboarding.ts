@@ -852,7 +852,7 @@ function obRef(id: string): string {
     {
       tool: {
         name: 'onboarding_render_template',
-        description: 'Resolve an onboarding email template (subject + HTML body + recipient) for a specific pipeline record. The API resolves all chapter/prospect fields, the app URL, and the meeting link automatically from its own database — you do not need to (and should not) supply substitution variables. Always pass `pipeline_id` (the pipeline record UUID you already have from onboarding_get/create/evaluate/initiate) — a prospect email is not unique to one chapter (the same person can lead more than one chapter in the pipeline at once), so `email` alone cannot reliably select the right record, and the API needs the exact record to generate the correct `Ref:` tracking number in the email footer. In non-production environments the recipient may be redirected to a test address — always send to the returned recipient, not the prospect email directly.',
+        description: 'LEGACY — prefer onboarding_send_emails / onboarding_prepare_emails, which choose templates and include co-organizers. Resolve an onboarding email template (subject + HTML body + recipient) for a specific pipeline record. The API resolves all chapter/prospect fields, the app URL, and the meeting link automatically from its own database — you do not need to (and should not) supply substitution variables. Always pass `pipeline_id` (the pipeline record UUID you already have from onboarding_get/create/evaluate/initiate) — a prospect email is not unique to one chapter (the same person can lead more than one chapter in the pipeline at once), so `email` alone cannot reliably select the right record, and the API needs the exact record to generate the correct `Ref:` tracking number in the email footer. In non-production environments the recipient may be redirected to a test address — always send to the returned recipient, not the prospect email directly.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -898,6 +898,76 @@ function obRef(id: string): string {
         }
       },
     },
+
+    {
+      tool: {
+        name: 'onboarding_prepare_emails',
+        description: 'Prepare every onboarding email for one purpose on a pipeline record: `welcome` (lead + co-organizers), `follow_up` (lead), `go_live` (lead + co-organizers), `nag` (lead). The API chooses the recipients (lead and, for welcome/go_live, co-organizers — registered or pending) and each person\'s template (e.g. "Chapter Welcome" vs "Chapter Welcome — Member"), and returns one rendered email per person in `emails`: {role, to, name, registered, template, subject, htmlBody, recipient}. Do NOT pick templates or build recipient lists yourself. Send EVERY item, not just the first: mcp__gmail__send_email with subject = item.subject, to = exactly item.recipient, mimeType "text/html", body = exactly item.htmlBody. A 409 means nobody can receive this email — do not retry; tell the admin to set a lead or co-organizer. Prefer onboarding_send_emails when it is available (it sends for you); use this only as the fallback. Call it again for the second welcome after someone registers — they then get the Member template. Replaces onboarding_render_template for new work.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            pipeline_id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
+            purpose: { type: 'string', enum: ['welcome', 'follow_up', 'go_live', 'nag'] },
+            variables: { type: 'object', description: 'Optional override fields; omit for a normal send.', additionalProperties: true },
+          },
+          required: ['pipeline_id', 'purpose'],
+          additionalProperties: false,
+        },
+      },
+      async handler(args) {
+        const blocked = await requireActive();
+        if (blocked) return err(blocked);
+        try {
+          const body: Record<string, unknown> = {
+            pipelineId: await resolvePipelineId(args.pipeline_id as string),
+            purpose: args.purpose as string,
+          };
+          if (args.variables !== undefined) body.variables = args.variables;
+          const data = await apiPost('/agent/onboarding/prepare-emails', body);
+          return ok(JSON.stringify(data, null, 2));
+        } catch (e) {
+          return err(e instanceof Error ? e.message : String(e));
+        }
+      },
+    },
+
+    // Registered only with skillscript, like onboarding_go_live: the send loop
+    // (one email per person) runs in the deterministic skill so the HTML never
+    // passes through the model and every recipient is sent.
+    ...(SKILLSCRIPT_RPC_URL
+      ? ([
+          {
+            tool: {
+              name: 'onboarding_send_emails',
+              description:
+                'Prepare AND send every onboarding email for one purpose on a pipeline record, in one deterministic call: `welcome` (lead + co-organizers), `follow_up` (lead), `go_live` (lead + co-organizers), `nag` (lead). The API picks the recipients (lead and, for welcome/go_live, co-organizers) and each person\'s template; one email is sent per person. Returns prepared, sent_count, failed_count, sent_to, failed and error. If prepared is "false" nobody could receive the email (API 409) — do not retry; tell the admin. If failed_count > 0, say exactly who failed and do NOT re-run it (the others would be emailed again). Does not advance the stage — call onboarding_advance afterwards as the flow says. Use this instead of onboarding_render_template + mcp__gmail__send_email.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  pipeline_id: { type: 'string', description: 'Pipeline record UUID or OB- reference.' },
+                  purpose: { type: 'string', enum: ['welcome', 'follow_up', 'go_live', 'nag'] },
+                },
+                required: ['pipeline_id', 'purpose'],
+                additionalProperties: false,
+              },
+            },
+            async handler(args) {
+              const blocked = await requireActive();
+              if (blocked) return err(blocked);
+              try {
+                const vars = await executeSkill('onboarding-send-emails', {
+                  PIPELINE_ID: await resolvePipelineId(args.pipeline_id as string),
+                  PURPOSE: args.purpose as string,
+                  BASE_URL: BASE_URL as string,
+                });
+                return ok(JSON.stringify(vars, null, 2));
+              } catch (e) {
+                return err(e instanceof Error ? e.message : String(e));
+              }
+            },
+          },
+        ] as McpToolDefinition[])
+      : []),
 
     {
       tool: {
