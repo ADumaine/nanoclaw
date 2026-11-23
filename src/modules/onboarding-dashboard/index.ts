@@ -21,6 +21,7 @@
 import { rewriteLocalhostUrl } from '../../container-runner.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { readEnvFile, readEnvPrefix } from '../../env.js';
+import { sendAlert } from '../../host-alert.js';
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -137,6 +138,10 @@ async function interceptDashboardTrigger(event: InboundEvent): Promise<boolean> 
 
   if (!result.ok) {
     log.error('onboarding-dashboard: onboarding-dashboard-trigger skill failed', { pipelineId, error: result.error });
+    sendAlert(
+      'trigger_skill_failed',
+      `Dashboard onboarding trigger failed for pipeline ${pipelineId}: ${result.error}`,
+    );
   } else {
     log.info('onboarding-dashboard: dashboard trigger handled deterministically', { pipelineId, replyText });
   }
@@ -153,6 +158,10 @@ async function interceptDashboardTrigger(event: InboundEvent): Promise<boolean> 
     );
   } catch (err) {
     log.error('onboarding-dashboard: failed to deliver reply', { pipelineId, err });
+    sendAlert(
+      'trigger_reply_failed',
+      `Dashboard trigger handled for pipeline ${pipelineId} but the reply could not be delivered: ${String(err)}`,
+    );
   }
   return true;
 }

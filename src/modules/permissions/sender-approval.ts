@@ -31,6 +31,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
+import { sendAlert } from '../../host-alert.js';
 import { pickApprovalDelivery, pickApprover, resolveApprovalThread } from '../approvals/primitive.js';
 import {
   createPendingSenderApproval,
@@ -105,6 +106,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
+    sendAlert(
+      'approval_no_approver',
+      `An unknown sender asked for access but no owner or admin is configured for agent group ${agentGroupId}; nobody can approve.`,
+    );
     notifyRequester(NOT_REACHED);
     return;
   }
@@ -118,6 +123,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
+    sendAlert(
+      'approval_no_approver',
+      `An unknown sender asked for access but no admin has a reachable DM channel (agent group ${agentGroupId}).`,
+    );
     notifyRequester(NOT_REACHED);
     return;
   }
@@ -157,6 +166,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     log.error('Unknown-sender approval row created but no delivery adapter is wired', {
       approvalId,
     });
+    sendAlert(
+      'approval_card_delivery_failed',
+      'An unknown-sender approval card could not be sent: no delivery adapter is wired.',
+    );
     notifyRequester(NOT_REACHED);
     return;
   }
@@ -188,6 +201,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       approvalId,
       err,
     });
+    sendAlert(
+      'approval_card_delivery_failed',
+      `Could not deliver an unknown-sender approval card to an admin: ${String(err)}`,
+    );
     // Drop the row so the dedup gate doesn't suppress every future attempt
     // (and the requester's retry gets another chance), and tell the requester.
     deletePendingSenderApproval(approvalId);

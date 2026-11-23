@@ -52,6 +52,7 @@ import {
   deleteSession,
 } from '../db/sessions.js';
 import { readEnvFile, readEnvPrefix } from '../env.js';
+import { sendAlert } from '../host-alert.js';
 import { log } from '../log.js';
 import { killContainer } from '../container-runner.js';
 import { sessionDir } from '../session-manager.js';
@@ -143,6 +144,10 @@ registerChannelAdapter(CHANNEL_TYPE, {
           log.debug('Webapp: typing callback rejected (best-effort)', { status: response.status });
         } else {
           log.warn('Webapp: callback delivery failed', { status: response.status, body });
+          sendAlert(
+            'callback_delivery_failed',
+            `API callback returned HTTP ${response.status} (type=${String(payload.type ?? 'message')}, app=${String(payload.app_id ?? '?')}): ${body.slice(0, 200)}`,
+          );
         }
         if (throwOnError) throw new Error(`callback rejected with HTTP ${response.status}`);
         return undefined;
@@ -153,6 +158,10 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
     async function handleClose(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
       if (req.headers['x-shared-secret'] !== sharedSecret) {
+        sendAlert(
+          'inbound_secret_rejected',
+          `Inbound /message rejected (bad secret) from ${req.socket.remoteAddress ?? 'unknown'}`,
+        );
         res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }

@@ -54,6 +54,7 @@ import {
   sessionDir,
 } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { sendAlert } from './host-alert.js';
 import type { Session } from './types.js';
 
 /**
@@ -301,6 +302,10 @@ function enforceRunningContainerSla(
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
+  sendAlert(
+    'container_stuck_message',
+    `Killed container ${session.id}: a message was claimed then silent for ${Math.round(decision.claimAgeMs / 1000)}s`,
+  );
   killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
