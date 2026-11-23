@@ -158,10 +158,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
 
     async function handleClose(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
       if (req.headers['x-shared-secret'] !== sharedSecret) {
-        sendAlert(
-          'inbound_secret_rejected',
-          `Inbound /message rejected (bad secret) from ${req.socket.remoteAddress ?? 'unknown'}`,
-        );
         res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
@@ -213,6 +209,10 @@ registerChannelAdapter(CHANNEL_TYPE, {
           from: req.socket.remoteAddress,
           header: req.headers['x-shared-secret'] ? '(present but wrong)' : '(missing)',
         });
+        sendAlert(
+          'inbound_secret_rejected',
+          `Inbound /message rejected (bad secret) from ${req.socket.remoteAddress ?? 'unknown'}`,
+        );
         res.writeHead(401).end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }

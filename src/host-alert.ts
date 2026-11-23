@@ -50,7 +50,13 @@ export function sendAlert(kind: string, detail: string): void {
     signal: AbortSignal.timeout(TIMEOUT_MS),
   })
     .then(async (res) => {
-      if (!res.ok) log.warn('Host alert rejected by API', { kind, status: res.status });
+      if (!res.ok) {
+        log.warn('Host alert rejected by API', { kind, status: res.status });
+        return;
+      }
+      const out = (await res.json().catch(() => ({}))) as { sent?: boolean; reason?: string };
+      if (out.sent === false) log.warn('Host alert not delivered by API', { kind, reason: out.reason });
+      else log.info('Host alert sent', { kind });
     })
     .catch((err) => log.warn('Host alert could not be sent', { kind, err: String(err) }));
 }
